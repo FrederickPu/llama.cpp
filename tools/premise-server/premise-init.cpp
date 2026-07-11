@@ -1,5 +1,5 @@
-#include "joint-init.hpp"
-#include "joint-retrieval.hpp"
+#include "premise-init.hpp"
+#include "premise-retrieval.hpp"
 #include "server-context.h"
 
 #include "common.h"
@@ -9,16 +9,16 @@
 #include <algorithm>
 #include <memory>
 
-void joint_setup(server_context & ctx_server,
-                 const std::string & joint_vec_path,
-                 const std::string & joint_str_path,
-                 JointMode joint_mode) {
-    const bool has_index_paths = !joint_vec_path.empty() && !joint_str_path.empty();
-    if (!has_index_paths && joint_mode == JointMode::Auto) {
+void premise_setup(server_context & ctx_server,
+                   const std::string & premise_vec_path,
+                   const std::string & premise_str_path,
+                   PremiseMode premise_mode) {
+    const bool has_index_paths = !premise_vec_path.empty() && !premise_str_path.empty();
+    if (!has_index_paths && premise_mode == PremiseMode::Auto) {
         return;
     }
 
-    if (joint_vec_path.empty() != joint_str_path.empty()) {
+    if (premise_vec_path.empty() != premise_str_path.empty()) {
         SRV_WRN("%s", "joint retrieval: --index-vecs and --index-strings must be provided together; offline index disabled\n");
     }
 
@@ -40,7 +40,7 @@ void joint_setup(server_context & ctx_server,
         }
     }
 
-    if (joint_mode == JointMode::Joint && emb_token_id < 0) {
+    if (premise_mode == PremiseMode::Joint && emb_token_id < 0) {
         SRV_ERR("%s", "joint retrieval: --joint requires a model with [EMB] token\n");
         return;
     }
@@ -59,17 +59,17 @@ void joint_setup(server_context & ctx_server,
     }
 
     try {
-        auto js = std::make_unique<JointRetrievalState>();
+        auto js = std::make_unique<PremiseRetrievalState>();
         js->emb_ctx      = emb_ctx;
         js->emb_token_id = emb_token_id;
-        js->joint_generation = joint_mode != JointMode::Embedding && emb_token_id >= 0;
+        js->joint_generation = premise_mode != PremiseMode::Embedding && emb_token_id >= 0;
         js->embedding_dim = llama_model_n_embd_out(model);
 
         if (has_index_paths) {
             js->premise_index = std::make_unique<PremiseIndex>();
             js->premise_index->load(
-                joint_vec_path.c_str(),
-                joint_str_path.c_str(),
+                premise_vec_path.c_str(),
+                premise_str_path.c_str(),
                 0 /* load all */);
             const int n_embd_out = js->embedding_dim;
             if (js->premise_index->dim != n_embd_out) {
@@ -79,9 +79,9 @@ void joint_setup(server_context & ctx_server,
             }
         }
 
-        g_joint_state = js.release();
-        const int n_premises = g_joint_state->premise_index ? g_joint_state->premise_index->n_premises : 0;
-        if (g_joint_state->joint_generation) {
+        g_premise_state = js.release();
+        const int n_premises = g_premise_state->premise_index ? g_premise_state->premise_index->n_premises : 0;
+        if (g_premise_state->joint_generation) {
             SRV_INF("joint retrieval ready: %d offline premises, [EMB] token=%d\n",
                     n_premises, emb_token_id);
         } else {
@@ -94,13 +94,13 @@ void joint_setup(server_context & ctx_server,
     }
 }
 
-void joint_cleanup() {
-    if (g_joint_state) {
-        if (g_joint_state->emb_ctx) {
-            llama_free(g_joint_state->emb_ctx);
-            g_joint_state->emb_ctx = nullptr;
+void premise_cleanup() {
+    if (g_premise_state) {
+        if (g_premise_state->emb_ctx) {
+            llama_free(g_premise_state->emb_ctx);
+            g_premise_state->emb_ctx = nullptr;
         }
-        delete g_joint_state;
-        g_joint_state = nullptr;
+        delete g_premise_state;
+        g_premise_state = nullptr;
     }
 }

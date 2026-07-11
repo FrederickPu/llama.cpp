@@ -19,8 +19,8 @@
 #include "llama.h"
 #include "log.h"
 
-#include "joint-init.hpp" // joint: setup/cleanup for retrieval state
-#include "joint-http.hpp" // joint: premise cache/retrieve routes
+#include "premise-init.hpp" // joint: setup/cleanup for retrieval state
+#include "premise-http.hpp" // joint: premise cache/retrieve routes
 
 #include <atomic>
 #include <clocale>
@@ -85,7 +85,7 @@ int llama_server(int argc, char ** argv) {
     // common_params_parse fails on unknown flags, so we pull out ours first.
     std::string joint_vec_path;
     std::string joint_str_path;
-    JointMode joint_mode = JointMode::Auto;
+    PremiseMode premise_mode = PremiseMode::Auto;
     std::vector<char *> filtered_args;
     {
         filtered_args.push_back(argv[0]);
@@ -96,9 +96,9 @@ int llama_server(int argc, char ** argv) {
             } else if (a == "--index-strings" && i + 1 < argc) {
                 joint_str_path = argv[++i];
             } else if (a == "--joint") {
-                joint_mode = JointMode::Joint;
+                premise_mode = PremiseMode::Joint;
             } else if (a == "--no-joint") {
-                joint_mode = JointMode::Embedding;
+                premise_mode = PremiseMode::Embedding;
             } else {
                 filtered_args.push_back(argv[i]);
             }
@@ -228,7 +228,7 @@ int llama_server(int argc, char ** argv) {
     ctx_http.get ("/slots",                    ex_wrapper(routes.get_slots));
     ctx_http.post("/slots/:id_slot",           ex_wrapper(routes.post_slots));
 
-    joint_register_http_routes(ctx_http);
+    premise_register_http_routes(ctx_http);
 
     ctx_http.register_gcp_compat();
 
@@ -288,7 +288,7 @@ int llama_server(int argc, char ** argv) {
             SRV_INF("%s: cleaning up before exit...\n", __func__);
             ctx_http.stop();
             ctx_server.terminate();
-            joint_cleanup(); // joint: free retrieval state
+            premise_cleanup(); // joint: free retrieval state
             llama_backend_free();
         };
 
@@ -316,7 +316,7 @@ int llama_server(int argc, char ** argv) {
         }
 
         // joint: initialize premise index and embedding context
-        joint_setup(ctx_server, joint_vec_path, joint_str_path, joint_mode);
+        premise_setup(ctx_server, joint_vec_path, joint_str_path, premise_mode);
 
         routes.update_meta(ctx_server);
         ctx_http.is_ready.store(true);

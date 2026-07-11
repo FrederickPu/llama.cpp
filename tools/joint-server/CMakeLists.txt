@@ -8,9 +8,6 @@ set(_ROOT_DIR  "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 
 add_executable(joint-server
     ${CMAKE_CURRENT_SOURCE_DIR}/server.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/joint-init.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/joint-retrieval.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/joint-http.cpp
     ${_SERVER_DIR}/server-context.cpp
     ${_SERVER_DIR}/server-http.cpp
     ${_SERVER_DIR}/server-chat.cpp
@@ -23,6 +20,7 @@ add_executable(joint-server
 
 target_include_directories(joint-server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/../premise-server
     ${_SERVER_DIR}
     ${_ROOT_DIR}
     ${_ROOT_DIR}/include
@@ -33,7 +31,7 @@ target_include_directories(joint-server PRIVATE
     ${_ROOT_DIR}/vendor/nlohmann
 )
 
-target_link_libraries(joint-server PRIVATE llama llama-common mtmd cpp-httplib llama-ui)
+target_link_libraries(joint-server PRIVATE premise-server-lib mtmd cpp-httplib llama-ui)
 target_compile_definitions(joint-server PRIVATE
     LLAMA_SERVER_CONTEXT_HOOKS_INCLUDE=\"joint-retrieval-hooks.hpp\")
 target_compile_features(joint-server PRIVATE cxx_std_17)

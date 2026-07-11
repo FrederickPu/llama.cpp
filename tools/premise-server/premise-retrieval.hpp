@@ -28,7 +28,7 @@ struct LeanModuleCacheEntry {
     std::vector<LeanPremiseRecord> declarations;
 };
 
-struct JointRetrievalRequest {
+struct PremiseRetrievalRequest {
     int top_k = 0;
     bool scoped = false;
     std::vector<std::string> imports;
@@ -39,7 +39,7 @@ struct JointRetrievalRequest {
 // SLOT_STATE_DONE_PROMPT). Initialized once after model load; thereafter only written
 // by the server loop thread (no concurrent emb_ctx access needed).
 
-struct JointRetrievalState {
+struct PremiseRetrievalState {
     llama_context *               emb_ctx      = nullptr;
     std::unique_ptr<PremiseIndex> premise_index;
     llama_token                   emb_token_id = -1;
@@ -55,15 +55,15 @@ struct JointRetrievalState {
     std::mutex                           pending_mu;
     std::condition_variable              pending_cv;
     std::unordered_map<int, std::string> pending_premises; // task_id -> SSE chunk
-    std::unordered_map<int, JointRetrievalRequest> task_requests;
+    std::unordered_map<int, PremiseRetrievalRequest> task_requests;
 };
 
-extern JointRetrievalState * g_joint_state;
+extern PremiseRetrievalState * g_premise_state;
 
-std::string joint_task_created(int task_id, const nlohmann::ordered_json & data, bool stream, int n_cmpl);
-void joint_prefill_complete(int task_id, const std::vector<llama_token> & prompt_tokens);
-std::string joint_take_initial_stream_prefix(int task_id);
+std::string premise_task_created(int task_id, const nlohmann::ordered_json & data, bool stream, int n_cmpl);
+void premise_prefill_complete(int task_id, const std::vector<llama_token> & prompt_tokens);
+std::string premise_take_initial_stream_prefix(int task_id);
 
-nlohmann::ordered_json joint_get_module_version(const nlohmann::ordered_json & data);
-nlohmann::ordered_json joint_cache_module(const nlohmann::ordered_json & data);
-nlohmann::ordered_json joint_retrieve(const nlohmann::ordered_json & data);
+nlohmann::ordered_json premise_get_module_version(const nlohmann::ordered_json & data);
+nlohmann::ordered_json premise_cache_module(const nlohmann::ordered_json & data);
+nlohmann::ordered_json premise_retrieve(const nlohmann::ordered_json & data);

@@ -1,4 +1,4 @@
-#include "joint-retrieval.hpp"
+#include "premise-retrieval.hpp"
 
 #include "common.h"
 #include "server-common.h"
@@ -12,15 +12,15 @@
 
 using json = nlohmann::ordered_json;
 
-JointRetrievalState * g_joint_state = nullptr;
+PremiseRetrievalState * g_premise_state = nullptr;
 
-static void joint_store_pending_premises(int task_id, std::string sse) {
+static void premise_store_pending_premises(int task_id, std::string sse) {
     {
-        std::lock_guard<std::mutex> lk(g_joint_state->pending_mu);
-        g_joint_state->task_requests.erase(task_id);
-        g_joint_state->pending_premises[task_id] = std::move(sse);
+        std::lock_guard<std::mutex> lk(g_premise_state->pending_mu);
+        g_premise_state->task_requests.erase(task_id);
+        g_premise_state->pending_premises[task_id] = std::move(sse);
     }
-    g_joint_state->pending_cv.notify_all();
+    g_premise_state->pending_cv.notify_all();
 }
 
 static std::string json_string_value(const json & data, const char * key, const std::string & def = {}) {
@@ -68,10 +68,10 @@ static std::vector<LeanDeclaration> parse_declarations(const json & data, const 
 }
 
 static std::vector<llama_token> tokenize_text(const std::string & text) {
-    if (!g_joint_state || !g_joint_state->emb_ctx) {
+    if (!g_premise_state || !g_premise_state->emb_ctx) {
         throw std::runtime_error("joint retrieval is not initialized");
     }
-    const llama_model * model = llama_get_model(g_joint_state->emb_ctx);
+    const llama_model * model = llama_get_model(g_premise_state->emb_ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
     int n_max = (int) text.size() + 64;
     std::vector<llama_token> tokens(std::max(8, n_max));
@@ -84,7 +84,7 @@ static std::vector<llama_token> tokenize_text(const std::string & text) {
         throw std::runtime_error("tokenization produced no tokens");
     }
     tokens.resize((size_t) n);
-    const int max_tokens = std::max(1, (int) llama_n_ctx(g_joint_state->emb_ctx) - 1);
+    const int max_tokens = std::max(1, (int) llama_n_ctx(g_premise_state->emb_ctx) - 1);
     if ((int) tokens.size() > max_tokens) {
         tokens.resize((size_t) max_tokens);
     }
@@ -92,41 +92,41 @@ static std::vector<llama_token> tokenize_text(const std::string & text) {
 }
 
 static std::vector<float> embed_tokens(std::vector<llama_token> tokens, bool append_emb) {
-    if (!g_joint_state || !g_joint_state->emb_ctx) {
+    if (!g_premise_state || !g_premise_state->emb_ctx) {
         throw std::runtime_error("joint retrieval is not initialized");
     }
     if (append_emb) {
-        if (g_joint_state->emb_token_id < 0) {
+        if (g_premise_state->emb_token_id < 0) {
             throw std::runtime_error("joint retrieval requires a model with [EMB] token");
         }
-        tokens.push_back(g_joint_state->emb_token_id);
+        tokens.push_back(g_premise_state->emb_token_id);
     }
     if (tokens.empty()) {
         throw std::runtime_error("cannot embed empty token sequence");
     }
-    const int max_tokens = (int) llama_n_ctx(g_joint_state->emb_ctx);
+    const int max_tokens = (int) llama_n_ctx(g_premise_state->emb_ctx);
     if ((int) tokens.size() > max_tokens) {
         tokens.erase(tokens.begin(), tokens.begin() + ((int) tokens.size() - max_tokens));
     }
 
-    std::lock_guard<std::mutex> emb_lock(g_joint_state->emb_mu);
-    llama_memory_clear(llama_get_memory(g_joint_state->emb_ctx), true);
+    std::lock_guard<std::mutex> emb_lock(g_premise_state->emb_mu);
+    llama_memory_clear(llama_get_memory(g_premise_state->emb_ctx), true);
 
-    const enum llama_pooling_type pooling_type = llama_pooling_type(g_joint_state->emb_ctx);
+    const enum llama_pooling_type pooling_type = llama_pooling_type(g_premise_state->emb_ctx);
     llama_batch batch = llama_batch_init((int) tokens.size(), 0, 1);
     try {
         for (int i = 0; i < (int) tokens.size(); ++i) {
             const bool output = pooling_type != LLAMA_POOLING_TYPE_NONE || i == (int) tokens.size() - 1;
             common_batch_add(batch, tokens[i], i, { 0 }, output);
         }
-        if (llama_decode(g_joint_state->emb_ctx, batch) != 0) {
+        if (llama_decode(g_premise_state->emb_ctx, batch) != 0) {
             throw std::runtime_error("embedding decode failed");
         }
 
-        const int n_embd = g_joint_state->embedding_dim > 0 ? g_joint_state->embedding_dim : llama_model_n_embd_out(llama_get_model(g_joint_state->emb_ctx));
+        const int n_embd = g_premise_state->embedding_dim > 0 ? g_premise_state->embedding_dim : llama_model_n_embd_out(llama_get_model(g_premise_state->emb_ctx));
         const float * raw = pooling_type == LLAMA_POOLING_TYPE_NONE
-            ? llama_get_embeddings_ith(g_joint_state->emb_ctx, batch.n_tokens - 1)
-            : llama_get_embeddings_seq(g_joint_state->emb_ctx, 0);
+            ? llama_get_embeddings_ith(g_premise_state->emb_ctx, batch.n_tokens - 1)
+            : llama_get_embeddings_seq(g_premise_state->emb_ctx, 0);
         if (!raw) {
             throw std::runtime_error("embedding output was not available");
         }
@@ -169,8 +169,8 @@ static void collect_module_declarations_locked(
     if (!visited_modules.insert(module).second) {
         return;
     }
-    auto it = g_joint_state->module_cache.find(module);
-    if (it == g_joint_state->module_cache.end()) {
+    auto it = g_premise_state->module_cache.find(module);
+    if (it == g_premise_state->module_cache.end()) {
         return;
     }
     for (const auto & imported : it->second.imports) {
@@ -188,7 +188,7 @@ static std::vector<const LeanPremiseRecord *> collect_cached_candidates(
         std::unordered_set<std::string> & seen_names) {
     std::vector<const LeanPremiseRecord *> candidates;
     std::unordered_set<std::string> visited_modules;
-    std::lock_guard<std::mutex> lk(g_joint_state->cache_mu);
+    std::lock_guard<std::mutex> lk(g_premise_state->cache_mu);
     for (const auto & module : imports) {
         collect_module_declarations_locked(module, visited_modules, seen_names, candidates);
     }
@@ -241,7 +241,7 @@ static json search_records_json(
     return arr;
 }
 
-static json search_request_json(const JointRetrievalRequest & request, const std::vector<float> & query) {
+static json search_request_json(const PremiseRetrievalRequest & request, const std::vector<float> & query) {
     std::unordered_set<std::string> seen_names;
     auto cached = collect_cached_candidates(request.imports, seen_names);
     std::vector<LeanDeclaration> local_decls;
@@ -256,7 +256,7 @@ static json search_request_json(const JointRetrievalRequest & request, const std
 }
 
 static json search_global_json(const std::vector<float> & query, int top_k) {
-    auto hits = g_joint_state->premise_index->search(query.data(), top_k);
+    auto hits = g_premise_state->premise_index->search(query.data(), top_k);
     json arr = json::array();
     for (auto & [stmt, score] : hits) {
         arr.push_back({{"statement", stmt}, {"decl", stmt}, {"score", score}});
@@ -264,13 +264,13 @@ static json search_global_json(const std::vector<float> & query, int top_k) {
     return arr;
 }
 
-std::string joint_task_created(int task_id, const json & data, bool stream, int n_cmpl) {
+std::string premise_task_created(int task_id, const json & data, bool stream, int n_cmpl) {
     const int top_k = stream && n_cmpl == 1 ? json_int_value(data, "retrieval_topk", json_int_value(data, "k", 5)) : -1;
-    if (!g_joint_state) {
+    if (!g_premise_state) {
         return {};
     }
 
-    if (!g_joint_state->joint_generation) {
+    if (!g_premise_state->joint_generation) {
         return "autoregressive generation requires a joint model with [EMB] token; use /select for premise retrieval";
     }
 
@@ -278,37 +278,37 @@ std::string joint_task_created(int task_id, const json & data, bool stream, int 
         return {};
     }
 
-    JointRetrievalRequest request;
+    PremiseRetrievalRequest request;
     request.top_k = top_k;
     request.imports = parse_string_array(data, "imports");
     request.declarations = parse_declarations(data);
     request.scoped = data.contains("imports") || data.contains("declarations");
-    if (!request.scoped && !g_joint_state->premise_index) {
+    if (!request.scoped && !g_premise_state->premise_index) {
         return {};
     }
 
-    std::lock_guard<std::mutex> lk(g_joint_state->pending_mu);
-    g_joint_state->task_requests[task_id] = std::move(request);
+    std::lock_guard<std::mutex> lk(g_premise_state->pending_mu);
+    g_premise_state->task_requests[task_id] = std::move(request);
     return {};
 }
 
-void joint_prefill_complete(int task_id, const std::vector<llama_token> & prompt_tokens) {
-    if (!g_joint_state || !g_joint_state->emb_ctx || !g_joint_state->joint_generation) {
+void premise_prefill_complete(int task_id, const std::vector<llama_token> & prompt_tokens) {
+    if (!g_premise_state || !g_premise_state->emb_ctx || !g_premise_state->joint_generation) {
         return;
     }
 
-    JointRetrievalRequest request;
+    PremiseRetrievalRequest request;
     {
-        std::lock_guard<std::mutex> lk(g_joint_state->pending_mu);
-        auto it = g_joint_state->task_requests.find(task_id);
-        if (it == g_joint_state->task_requests.end()) {
+        std::lock_guard<std::mutex> lk(g_premise_state->pending_mu);
+        auto it = g_premise_state->task_requests.find(task_id);
+        if (it == g_premise_state->task_requests.end()) {
             return;
         }
         request = it->second;
     }
 
     if (request.top_k <= 0) {
-        joint_store_pending_premises(task_id, {});
+        premise_store_pending_premises(task_id, {});
         return;
     }
 
@@ -316,52 +316,52 @@ void joint_prefill_complete(int task_id, const std::vector<llama_token> & prompt
         auto query = embed_tokens(prompt_tokens, true);
         json arr = request.scoped
             ? search_request_json(request, query)
-            : (g_joint_state->premise_index ? search_global_json(query, request.top_k) : json::array());
+            : (g_premise_state->premise_index ? search_global_json(query, request.top_k) : json::array());
 
         json evt = {{"type", "premises"}, {"premises", arr}};
         std::string sse = "data: " + evt.dump() + "\n\n";
 
-        joint_store_pending_premises(task_id, std::move(sse));
+        premise_store_pending_premises(task_id, std::move(sse));
     } catch (const std::exception & e) {
         SRV_WRN("joint retrieval: %s\n", e.what());
-        joint_store_pending_premises(task_id, {});
+        premise_store_pending_premises(task_id, {});
     }
 }
 
-std::string joint_take_initial_stream_prefix(int task_id) {
-    if (!g_joint_state || task_id < 0) {
+std::string premise_take_initial_stream_prefix(int task_id) {
+    if (!g_premise_state || task_id < 0) {
         return {};
     }
 
-    std::unique_lock<std::mutex> lk(g_joint_state->pending_mu);
-    g_joint_state->pending_cv.wait_for(lk, std::chrono::seconds(10), [task_id] {
-        return g_joint_state->pending_premises.find(task_id) != g_joint_state->pending_premises.end() ||
-               g_joint_state->task_requests.find(task_id) == g_joint_state->task_requests.end();
+    std::unique_lock<std::mutex> lk(g_premise_state->pending_mu);
+    g_premise_state->pending_cv.wait_for(lk, std::chrono::seconds(10), [task_id] {
+        return g_premise_state->pending_premises.find(task_id) != g_premise_state->pending_premises.end() ||
+               g_premise_state->task_requests.find(task_id) == g_premise_state->task_requests.end();
     });
 
-    auto it = g_joint_state->pending_premises.find(task_id);
-    if (it == g_joint_state->pending_premises.end()) {
-        g_joint_state->task_requests.erase(task_id);
+    auto it = g_premise_state->pending_premises.find(task_id);
+    if (it == g_premise_state->pending_premises.end()) {
+        g_premise_state->task_requests.erase(task_id);
         return {};
     }
 
     std::string sse = std::move(it->second);
-    g_joint_state->pending_premises.erase(it);
+    g_premise_state->pending_premises.erase(it);
     return sse;
 }
 
-json joint_get_module_version(const json & data) {
+json premise_get_module_version(const json & data) {
     const std::string module = json_string_value(data, "module");
-    if (!g_joint_state || module.empty()) {
+    if (!g_premise_state || module.empty()) {
         return nullptr;
     }
-    std::lock_guard<std::mutex> lk(g_joint_state->cache_mu);
-    auto it = g_joint_state->module_cache.find(module);
-    return it == g_joint_state->module_cache.end() ? json(nullptr) : json(it->second.version_token);
+    std::lock_guard<std::mutex> lk(g_premise_state->cache_mu);
+    auto it = g_premise_state->module_cache.find(module);
+    return it == g_premise_state->module_cache.end() ? json(nullptr) : json(it->second.version_token);
 }
 
-json joint_cache_module(const json & data) {
-    if (!g_joint_state) {
+json premise_cache_module(const json & data) {
+    if (!g_premise_state) {
         throw std::runtime_error("joint retrieval is not initialized");
     }
     const std::string module = json_string_value(data, "module");
@@ -379,17 +379,17 @@ json joint_cache_module(const json & data) {
     entry.declarations = embed_declarations(parse_declarations(data), module);
 
     {
-        std::lock_guard<std::mutex> lk(g_joint_state->cache_mu);
-        g_joint_state->module_cache[module] = std::move(entry);
+        std::lock_guard<std::mutex> lk(g_premise_state->cache_mu);
+        g_premise_state->module_cache[module] = std::move(entry);
     }
     return json{{"ok", true}};
 }
 
-json joint_retrieve(const json & data) {
-    if (!g_joint_state) {
+json premise_retrieve(const json & data) {
+    if (!g_premise_state) {
         throw std::runtime_error("joint retrieval is not initialized");
     }
-    JointRetrievalRequest request;
+    PremiseRetrievalRequest request;
     request.top_k = json_int_value(data, "k", 5);
     request.imports = parse_string_array(data, "imports");
     request.declarations = parse_declarations(data);
@@ -400,7 +400,7 @@ json joint_retrieve(const json & data) {
         throw std::runtime_error("missing goal");
     }
 
-    auto query = embed_text(goal, g_joint_state->joint_generation);
+    auto query = embed_text(goal, g_premise_state->joint_generation);
     json premises = search_request_json(request, query);
     json suggestions = json::array();
     for (const auto & premise : premises) {
