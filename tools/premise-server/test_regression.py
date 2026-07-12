@@ -1,13 +1,16 @@
 """
-Premise-server regression test and usage guide.
+Standalone premise-server demo and regression test.
 
-This script builds and starts the standalone `premise-server` tool, then
-exercises the Lean premise API:
+The premise-server is the embedding-only server used by CanonicalDrafter to
+rank Lean premises. It does not generate text. The intended flow is:
 
-  - /version
-  - /cache
-  - /select
+  1. Start premise-server with a GGUF embedding model.
+  2. Pass --index-vecs and --index-strings so declaration embeddings persist.
+  3. Ask /version whether a Lean module is already cached in this process.
+  4. Send declarations to /cache when the version token is missing or stale.
+  5. Call /select with imports, local declarations, a goal, and k.
 
+Run with --print-guide to see the equivalent manual commands and JSON bodies.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import textwrap
@@ -45,10 +49,19 @@ CMAKE_CONFIGURE_ARGS = [
 ]
 
 DEFAULT_MODEL = Path("D:/hparam_outputs/thomas-zhu-lean-premise.f16.gguf")
+DEFAULT_INDEX_VECS = BUILD_DIR / "premise-demo-vectors.bin"
+DEFAULT_INDEX_STRINGS = BUILD_DIR / "premise-demo-strings.json"
 THOMAS_ZHU_MODEL_ID = "l3lab/all-distilroberta-v1-lr2e-4-bs256-nneg3-ml-ne2"
 THOMAS_ZHU_MODEL_REVISION = "v4.30.0"
 
 BASE_URL = "http://127.0.0.1:8081"
+DEMO_MODULE = "Demo.Module"
+DEMO_TOKEN = "premise-server-demo-v1"
+DEMO_DECLARATIONS = [
+    {"name": "Demo.zero_add", "decl": "theorem zero_add (n : Nat) : 0 + n = n"},
+    {"name": "Demo.add_zero", "decl": "theorem add_zero (n : Nat) : n + 0 = n"},
+]
+DEMO_GOAL = "|- n + 0 = n"
 
 
 def die(message: str) -> None:
@@ -106,6 +119,9 @@ def premise_server_command(args: argparse.Namespace) -> list[str]:
         "--model", str(args.model),
         "--pooling", args.pooling,
         "--ctx-size", str(args.ctx_size),
+        "--parallel", str(args.parallel),
+        "--index-vecs", str(args.index_vecs),
+        "--index-strings", str(args.index_strings),
     ]
     command.extend(args.server_arg or [])
     return command
@@ -123,6 +139,8 @@ class ManagedPremiseServer:
                 f"Premise-server GGUF does not exist: {self.args.model}\n"
                 f"Expected Thomas Zhu model: {THOMAS_ZHU_MODEL_ID} revision {THOMAS_ZHU_MODEL_REVISION}"
             )
+        self.args.index_vecs.parent.mkdir(parents=True, exist_ok=True)
+        self.args.index_strings.parent.mkdir(parents=True, exist_ok=True)
 
         env = os.environ.copy()
         if BUILD_BIN_DIR.exists():
@@ -171,7 +189,13 @@ class ManagedPremiseServer:
     def __exit__(self, exc_type, exc, tb) -> None:
         if self.process and self.process.poll() is None:
             print("Stopping premise-server", flush=True)
-            self.process.terminate()
+            if os.name == "nt":
+                try:
+                    os.kill(self.process.pid, signal.CTRL_C_EVENT)
+                except OSError:
+                    self.process.terminate()
+            else:
+                self.process.terminate()
             try:
                 self.process.wait(timeout=10)
             except subprocess.TimeoutExpired:
@@ -191,82 +215,163 @@ def post_json(path: str, body: dict, timeout: int = 120):
         return json.loads(response.read().decode("utf-8"))
 
 
-def run_tests(args: argparse.Namespace) -> bool:
-    global BASE_URL
-    BASE_URL = f"http://{args.host}:{args.port}"
-
-    before = post_json("/version", {"module": "Demo.Module"})
-    if before is not None:
-        print(f"[FAIL] expected uncached module version to be null, got {before!r}", file=sys.stderr)
-        return False
-
-    cache_body = {
-        "module": "Demo.Module",
+def cache_body() -> dict:
+    return {
+        "module": DEMO_MODULE,
         "imports": [],
-        "declarations": [
-            {"name": "Demo.zero_add", "decl": "theorem zero_add (n : Nat) : 0 + n = n"},
-            {"name": "Demo.add_zero", "decl": "theorem add_zero (n : Nat) : n + 0 = n"},
-        ],
-        "token": "premise-server-demo-v1",
+        "declarations": DEMO_DECLARATIONS,
+        "token": DEMO_TOKEN,
     }
-    cache_result = post_json("/cache", cache_body)
+
+
+def select_body(k: int = 2) -> dict:
+    return {
+        "imports": [DEMO_MODULE],
+        "declarations": [],
+        "goal": DEMO_GOAL,
+        "k": k,
+    }
+
+
+def dump_json(data: dict) -> str:
+    return json.dumps(data, indent=2, ensure_ascii=False)
+
+
+def run_tests(args: argparse.Namespace) -> bool:
+    print(f"Using premise-server at {BASE_URL}", flush=True)
+
+    print(f"1. Checking /version for uncached module {DEMO_MODULE!r}", flush=True)
+    before = post_json("/version", {"module": DEMO_MODULE})
+    if before is not None and not isinstance(before, str):
+        print(f"[FAIL] expected null or a version token string, got {before!r}", file=sys.stderr)
+        return False
+    if before is not None:
+        print(f"   module already has token {before!r}; refreshing it with {DEMO_TOKEN!r}", flush=True)
+
+    print(f"2. Sending {len(DEMO_DECLARATIONS)} declarations to /cache", flush=True)
+    cache_result = post_json("/cache", cache_body())
     if cache_result != {"ok": True}:
         print(f"[FAIL] /cache returned {cache_result!r}", file=sys.stderr)
         return False
 
-    after = post_json("/version", {"module": "Demo.Module"})
-    if after != "premise-server-demo-v1":
+    print("3. Verifying /version returns the cached token", flush=True)
+    after = post_json("/version", {"module": DEMO_MODULE})
+    if after != DEMO_TOKEN:
         print(f"[FAIL] expected cached module token, got {after!r}", file=sys.stderr)
         return False
 
-    suggestions = post_json("/select", {
-        "imports": ["Demo.Module"],
-        "declarations": [],
-        "goal": "|- n + 0 = n",
-        "k": 2,
-    })
+    print(f"4. Asking /select for premises relevant to goal {DEMO_GOAL!r}", flush=True)
+    suggestions = post_json("/select", select_body())
     if len(suggestions) != 2 or not all("name" in item and "score" in item for item in suggestions):
         print(f"[FAIL] /select returned malformed suggestions: {suggestions!r}", file=sys.stderr)
         return False
 
-    print("premise-server regression OK:", suggestions, flush=True)
+    print("premise-server demo OK. Suggestions:", flush=True)
+    print(json.dumps(suggestions, indent=2), flush=True)
     return True
 
 
 def print_usage_guide(args: argparse.Namespace) -> None:
     premise_server_exe = args.server_bin or find_exe("premise-server") or (BUILD_BIN_DIR / ("premise-server.exe" if os.name == "nt" else "premise-server"))
+    version_request = dump_json({"module": DEMO_MODULE})
+    cache_request = dump_json(cache_body())
+    select_request = dump_json(select_body())
+    line_continue = "^" if os.name == "nt" else "\\"
     guide = f"""Manual equivalent of this regression runner
 ==========================================
 
-1. Build premise-server:
+Model
+-----
+
+This demo expects a GGUF embedding model compatible with Lean premise retrieval.
+The default is:
+
+  Hugging Face: {THOMAS_ZHU_MODEL_ID}
+  Revision:     {THOMAS_ZHU_MODEL_REVISION}
+  Local GGUF:   {args.model}
+
+Download or convert the model separately, then pass its GGUF path with --model.
+
+Build
+-----
 
    cmake -S {LLAMA_DIR} -B {BUILD_DIR} {' '.join(CMAKE_CONFIGURE_ARGS)}
    cmake --build {BUILD_DIR} --target premise-server
 
-2. Start premise-server:
+Start
+-----
 
-   Model: {THOMAS_ZHU_MODEL_ID} revision {THOMAS_ZHU_MODEL_REVISION}
+The --index-vecs and --index-strings files are a persistent decl-string to
+embedding cache. Keep them across restarts so /cache does not re-embed every
+declaration each time the server starts.
 
-   {premise_server_exe} --host {args.host} --port {args.port} --model {args.model} ^
-       --pooling {args.pooling} --ctx-size {args.ctx_size}
+   {premise_server_exe} --host {args.host} --port {args.port} --model {args.model} {line_continue}
+       --pooling {args.pooling} --ctx-size {args.ctx_size} --parallel {args.parallel} {line_continue}
+       --index-vecs {args.index_vecs} {line_continue}
+       --index-strings {args.index_strings}
 
-3. Query the Lean premise API:
+API
+---
+
+1. Check whether the module token is already cached in this process.
 
    POST http://{args.host}:{args.port}/version
+   Content-Type: application/json
+
+{textwrap.indent(version_request, "   ")}
+
+   Expected before /cache: null
+
+2. Cache or refresh declarations for that module.
+
    POST http://{args.host}:{args.port}/cache
+   Content-Type: application/json
+
+{textwrap.indent(cache_request, "   ")}
+
+   Expected response: {{"ok":true}}
+
+3. Confirm the module token now matches.
+
+   POST http://{args.host}:{args.port}/version
+   Content-Type: application/json
+
+{textwrap.indent(version_request, "   ")}
+
+   Expected after /cache: "{DEMO_TOKEN}"
+
+4. Select premises for a goal.
+
+   The imports list names modules that were populated by /cache. The
+   declarations field is for local, one-off candidates that should be considered
+   for this request but not stored as a module cache entry.
+
    POST http://{args.host}:{args.port}/select
+   Content-Type: application/json
 
-Expected behavior:
+{textwrap.indent(select_request, "   ")}
 
-   /version returns null before /cache and the token after /cache
-   /select returns premise suggestions
+   Expected response shape:
+
+   [{{"name":"Demo.add_zero","score":0.87}}, ...]
+
+Notes
+-----
+
+  - /version is an in-memory module freshness check; it resets on restart.
+  - --index-vecs/--index-strings persist declaration embeddings on disk, not
+    module version tokens.
+  - --parallel controls how many embedding contexts premise-server can use.
+  - /select can include unsaved local declarations in the request body.
+  - --url runs the same /version, /cache, and /select demo against an existing
+    compatible premise-server and will refresh {DEMO_MODULE} in that process.
 """
     print(guide.strip())
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Start premise-server and test /version, /cache, and /select.",
+        description="Start premise-server and demonstrate /version, /cache, and /select.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
         Common flows:
@@ -276,12 +381,15 @@ def parse_args() -> argparse.Namespace:
         """),
     )
     parser.add_argument("--print-guide", action="store_true", help="Print manual build/start/query commands and exit")
-    parser.add_argument("--url", help="Use an already-running premise-server instead of starting one")
+    parser.add_argument("--url", help="Use an already-running compatible premise-server; refreshes the demo module in that process")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8081)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL, help="GGUF embedding model")
     parser.add_argument("--pooling", default="mean")
     parser.add_argument("--ctx-size", type=int, default=512)
+    parser.add_argument("--parallel", type=int, default=2, help="Number of embedding contexts used by premise-server")
+    parser.add_argument("--index-vecs", type=Path, default=DEFAULT_INDEX_VECS, help="Persistent embedding vector cache")
+    parser.add_argument("--index-strings", type=Path, default=DEFAULT_INDEX_STRINGS, help="Persistent declaration string cache")
     parser.add_argument("--startup-timeout", type=int, default=180)
     parser.add_argument("--server-bin", type=Path, help="Path to premise-server executable")
     parser.add_argument("--server-log", type=Path)
@@ -301,6 +409,7 @@ def main() -> int:
         BASE_URL = args.url.rstrip("/")
         return 0 if run_tests(args) else 1
 
+    BASE_URL = f"http://{args.host}:{args.port}"
     with ManagedPremiseServer(args):
         return 0 if run_tests(args) else 1
 
