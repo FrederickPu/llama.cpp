@@ -67,6 +67,15 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
+    // LLAMA_EXAMPLE_SERVER defaults n_parallel to -1 (auto); llama-server's
+    // main resolves it before load_model, so we must too or context creation
+    // fails. A single slot suffices: generation is never used here, and the
+    // premise embedding work runs on a dedicated context (premise-init.cpp).
+    if (params.n_parallel < 0) {
+        params.n_parallel = 1;
+        params.kv_unified = true;
+    }
+
     llama_backend_init();
     llama_numa_init(params.numa);
     common_params_print_info(params, true);
