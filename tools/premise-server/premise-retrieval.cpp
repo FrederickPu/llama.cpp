@@ -148,6 +148,7 @@ static std::vector<float> embed_text(const std::string & text, bool append_emb) 
 static std::vector<LeanPremiseRecord> embed_declarations(
         const std::vector<LeanDeclaration> & declarations,
         const std::string & module) {
+    auto * cache = g_premise_state ? g_premise_state->embed_cache.get() : nullptr;
     std::vector<LeanPremiseRecord> out;
     out.reserve(declarations.size());
     for (const auto & decl : declarations) {
@@ -155,7 +156,12 @@ static std::vector<LeanPremiseRecord> embed_declarations(
         record.name = decl.name;
         record.decl = decl.decl;
         record.module = module;
-        record.embedding = embed_text(decl.decl, false);
+        if (!(cache && cache->find(decl.decl, record.embedding))) {
+            record.embedding = embed_text(decl.decl, false);
+            if (cache) {
+                cache->insert(decl.decl, record.embedding);
+            }
+        }
         out.push_back(std::move(record));
     }
     return out;
@@ -381,6 +387,9 @@ json premise_cache_module(const json & data) {
     {
         std::lock_guard<std::mutex> lk(g_premise_state->cache_mu);
         g_premise_state->module_cache[module] = std::move(entry);
+    }
+    if (g_premise_state->embed_cache) {
+        g_premise_state->embed_cache->maybe_save(false);
     }
     return json{{"ok", true}};
 }

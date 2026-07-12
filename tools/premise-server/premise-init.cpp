@@ -65,7 +65,13 @@ void premise_setup(server_context & ctx_server,
         js->joint_generation = premise_mode != PremiseMode::Embedding && emb_token_id >= 0;
         js->embedding_dim = llama_model_n_embd_out(model);
 
-        if (has_index_paths) {
+        if (has_index_paths && premise_mode == PremiseMode::Embedding) {
+            // cache/select mode: the index paths name a persistent embedding
+            // cache that this server creates and updates itself, so missing
+            // files just mean a cold cache.
+            js->embed_cache = std::make_unique<PremiseEmbedCache>();
+            js->embed_cache->load(premise_vec_path, premise_str_path, js->embedding_dim);
+        } else if (has_index_paths) {
             js->premise_index = std::make_unique<PremiseIndex>();
             js->premise_index->load(
                 premise_vec_path.c_str(),
@@ -96,6 +102,9 @@ void premise_setup(server_context & ctx_server,
 
 void premise_cleanup() {
     if (g_premise_state) {
+        if (g_premise_state->embed_cache) {
+            g_premise_state->embed_cache->maybe_save(true);
+        }
         if (g_premise_state->emb_ctx) {
             llama_free(g_premise_state->emb_ctx);
             g_premise_state->emb_ctx = nullptr;

@@ -42,6 +42,7 @@ struct PremiseRetrievalRequest {
 struct PremiseRetrievalState {
     llama_context *               emb_ctx      = nullptr;
     std::unique_ptr<PremiseIndex> premise_index;
+    std::unique_ptr<PremiseEmbedCache> embed_cache;
     llama_token                   emb_token_id = -1;
     int                           embedding_dim = 0;
     bool                          joint_generation = false;
