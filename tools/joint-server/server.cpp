@@ -316,7 +316,7 @@ int llama_server(int argc, char ** argv) {
         }
 
         // joint: initialize premise index and embedding context
-        premise_setup(ctx_server, joint_vec_path, joint_str_path, premise_mode);
+        premise_setup(ctx_server, joint_vec_path, joint_str_path, premise_mode, params.n_parallel);
 
         routes.update_meta(ctx_server);
         ctx_http.is_ready.store(true);

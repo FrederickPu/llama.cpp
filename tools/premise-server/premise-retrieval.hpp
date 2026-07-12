@@ -36,11 +36,12 @@ struct PremiseRetrievalRequest {
 };
 
 // Shared state between server.cpp (initialization) and server-context.cpp (use at
-// SLOT_STATE_DONE_PROMPT). Initialized once after model load; thereafter only written
-// by the server loop thread (no concurrent emb_ctx access needed).
+// SLOT_STATE_DONE_PROMPT). Initialized once after model load; embedding contexts
+// are leased so concurrent HTTP requests do not share a llama_context.
 
 struct PremiseRetrievalState {
-    llama_context *               emb_ctx      = nullptr;
+    std::vector<llama_context *>  emb_ctxs;
+    std::vector<llama_context *>  idle_emb_ctxs;
     std::unique_ptr<PremiseIndex> premise_index;
     std::unique_ptr<PremiseEmbedCache> embed_cache;
     llama_token                   emb_token_id = -1;
@@ -48,6 +49,7 @@ struct PremiseRetrievalState {
     bool                          joint_generation = false;
 
     std::mutex emb_mu;
+    std::condition_variable emb_cv;
     std::mutex cache_mu;
     std::unordered_map<std::string, LeanModuleCacheEntry> module_cache;
 

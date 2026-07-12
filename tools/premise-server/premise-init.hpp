@@ -15,7 +15,8 @@ enum class PremiseMode {
 void premise_setup(server_context & ctx_server,
                    const std::string & premise_vec_path,
                    const std::string & premise_str_path,
-                   PremiseMode premise_mode);
+                   PremiseMode premise_mode,
+                   int embedding_workers);
 
 // Free g_premise_state. Safe to call when g_premise_state is null.
 void premise_cleanup();

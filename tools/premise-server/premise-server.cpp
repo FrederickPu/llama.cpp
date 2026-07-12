@@ -120,7 +120,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    premise_setup(ctx_server, premise_vec_path, premise_str_path, PremiseMode::Embedding);
+    premise_setup(ctx_server, premise_vec_path, premise_str_path, PremiseMode::Embedding, params.n_parallel);
     ctx_http.is_ready.store(true);
     SRV_INF("server is listening on %s\n", ctx_http.listening_address.c_str());
 

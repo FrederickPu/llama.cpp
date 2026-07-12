@@ -8,11 +8,14 @@
 
 #include <algorithm>
 #include <memory>
+#include <stdexcept>
+#include <vector>
 
 void premise_setup(server_context & ctx_server,
                    const std::string & premise_vec_path,
                    const std::string & premise_str_path,
-                   PremiseMode premise_mode) {
+                   PremiseMode premise_mode,
+                   int embedding_workers) {
     const bool has_index_paths = !premise_vec_path.empty() && !premise_str_path.empty();
     if (!has_index_paths && premise_mode == PremiseMode::Auto) {
         return;
@@ -52,51 +55,66 @@ void premise_setup(server_context & ctx_server,
     ep.embeddings = true;
     ep.pooling_type = llama_pooling_type(gen_ctx);
 
-    llama_context * emb_ctx = llama_init_from_model(model, ep);
-    if (!emb_ctx) {
-        SRV_ERR("%s", "joint retrieval: failed to create embedding context\n");
-        return;
-    }
+    std::vector<llama_context *> emb_ctxs;
+    const int n_emb_ctxs = std::max(1, embedding_workers);
 
     try {
-        auto js = std::make_unique<PremiseRetrievalState>();
-        js->emb_ctx      = emb_ctx;
-        js->emb_token_id = emb_token_id;
-        js->joint_generation = premise_mode != PremiseMode::Embedding && emb_token_id >= 0;
-        js->embedding_dim = llama_model_n_embd_out(model);
+        emb_ctxs.reserve(n_emb_ctxs);
+        for (int i = 0; i < n_emb_ctxs; ++i) {
+            llama_context * emb_ctx = llama_init_from_model(model, ep);
+            if (!emb_ctx) {
+                throw std::runtime_error("failed to create embedding context");
+            }
+            emb_ctxs.push_back(emb_ctx);
+        }
+
+        const int embedding_dim = llama_model_n_embd_out(model);
+        std::unique_ptr<PremiseEmbedCache> embed_cache;
+        std::unique_ptr<PremiseIndex> premise_index;
 
         if (has_index_paths && premise_mode == PremiseMode::Embedding) {
             // cache/select mode: the index paths name a persistent embedding
             // cache that this server creates and updates itself, so missing
             // files just mean a cold cache.
-            js->embed_cache = std::make_unique<PremiseEmbedCache>();
-            js->embed_cache->load(premise_vec_path, premise_str_path, js->embedding_dim);
+            embed_cache = std::make_unique<PremiseEmbedCache>();
+            embed_cache->load(premise_vec_path, premise_str_path, embedding_dim);
         } else if (has_index_paths) {
-            js->premise_index = std::make_unique<PremiseIndex>();
-            js->premise_index->load(
+            premise_index = std::make_unique<PremiseIndex>();
+            premise_index->load(
                 premise_vec_path.c_str(),
                 premise_str_path.c_str(),
                 0 /* load all */);
-            const int n_embd_out = js->embedding_dim;
-            if (js->premise_index->dim != n_embd_out) {
+            const int n_embd_out = embedding_dim;
+            if (premise_index->dim != n_embd_out) {
                 SRV_ERR("joint retrieval: premise index dimension %d does not match model embedding dimension %d; offline index disabled\n",
-                        js->premise_index->dim, n_embd_out);
-                js->premise_index.reset();
+                        premise_index->dim, n_embd_out);
+                premise_index.reset();
             }
         }
+
+        auto js = std::make_unique<PremiseRetrievalState>();
+        js->emb_ctxs      = std::move(emb_ctxs);
+        js->idle_emb_ctxs = js->emb_ctxs;
+        js->emb_token_id = emb_token_id;
+        js->joint_generation = premise_mode != PremiseMode::Embedding && emb_token_id >= 0;
+        js->embedding_dim = embedding_dim;
+        js->embed_cache = std::move(embed_cache);
+        js->premise_index = std::move(premise_index);
 
         g_premise_state = js.release();
         const int n_premises = g_premise_state->premise_index ? g_premise_state->premise_index->n_premises : 0;
         if (g_premise_state->joint_generation) {
-            SRV_INF("joint retrieval ready: %d offline premises, [EMB] token=%d\n",
-                    n_premises, emb_token_id);
+            SRV_INF("joint retrieval ready: %d offline premises, [EMB] token=%d, embedding workers=%d\n",
+                    n_premises, emb_token_id, n_emb_ctxs);
         } else {
-            SRV_INF("joint retrieval ready: cache/select embedding mode, %d offline premises, no [EMB] token\n",
-                    n_premises);
+            SRV_INF("joint retrieval ready: cache/select embedding mode, %d offline premises, embedding workers=%d\n",
+                    n_premises, n_emb_ctxs);
         }
     } catch (const std::exception & e) {
         SRV_ERR("joint retrieval: initialization failed: %s\n", e.what());
-        llama_free(emb_ctx);
+        for (llama_context * emb_ctx : emb_ctxs) {
+            llama_free(emb_ctx);
+        }
     }
 }
 
@@ -105,10 +123,11 @@ void premise_cleanup() {
         if (g_premise_state->embed_cache) {
             g_premise_state->embed_cache->maybe_save(true);
         }
-        if (g_premise_state->emb_ctx) {
-            llama_free(g_premise_state->emb_ctx);
-            g_premise_state->emb_ctx = nullptr;
+        for (llama_context * emb_ctx : g_premise_state->emb_ctxs) {
+            llama_free(emb_ctx);
         }
+        g_premise_state->emb_ctxs.clear();
+        g_premise_state->idle_emb_ctxs.clear();
         delete g_premise_state;
         g_premise_state = nullptr;
     }
