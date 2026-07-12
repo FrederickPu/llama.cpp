@@ -1,0 +1,255 @@
+name: Premise Release
+
+# Builds llama-server + premise-server for the six platforms CanonicalDrafter's
+# Llama.lean supports, and publishes them as self-contained archives on a
+# GitHub release. Unlike upstream release.yml (which splits Windows backends
+# into separate DLL-only zips), every archive here contains all binaries and
+# backend libraries needed to run on that platform, because the Lean side
+# downloads exactly one asset per platform.
+#
+# Asset names follow the upstream pattern Llama.lean already parses:
+#   llama-<tag>-bin-macos-arm64.tar.gz        (Metal)
+#   llama-<tag>-bin-macos-x64.tar.gz          (CPU)
+#   llama-<tag>-bin-ubuntu-vulkan-x64.tar.gz
+#   llama-<tag>-bin-ubuntu-vulkan-arm64.tar.gz
+#   llama-<tag>-bin-win-vulkan-x64.zip
+#   llama-<tag>-bin-win-cpu-arm64.zip
+#
+# Trigger: push a tag named premise-* (the tag becomes the release name and the
+# llamaCppTag constant on the Lean side), or run manually via workflow_dispatch
+# to check the builds without publishing (set create_release to also publish).
+
+on:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Also create a release from this run'
+        required: false
+        default: false
+        type: boolean
+  push:
+    tags:
+      - 'premise-*'
+
+permissions:
+  contents: read
+
+env:
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DPremiseServer=ON"
+
+concurrency:
+  group: premise-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      name: ${{ steps.tag.outputs.name }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - id: tag
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=premise-b$(git rev-list --count HEAD)-$(git rev-parse --short=7 HEAD)" >> $GITHUB_OUTPUT
+          fi
+
+  macos:
+    needs: [tag]
+    strategy:
+      matrix:
+        include:
+          - build: 'arm64'
+            os: macos-26
+            defines: "-DGGML_METAL_USE_BF16=ON -DGGML_METAL_EMBED_LIBRARY=ON"
+          # Metal is disabled on x64 following upstream (runners have no GPU)
+          - build: 'x64'
+            os: macos-15-intel
+            defines: "-DGGML_METAL=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: premise-release-${{ matrix.os }}-${{ matrix.build }}
+
+      - name: Build
+        run: |
+          cmake -B build \
+            ${{ matrix.defines }} \
+            -DCMAKE_INSTALL_RPATH='@loader_path' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DLLAMA_BUILD_BORINGSSL=ON \
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release -j $(sysctl -n hw.logicalcpu)
+
+      - name: Pack artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          tar -czvf llama-${{ needs.tag.outputs.name }}-bin-macos-${{ matrix.build }}.tar.gz -s ",^\.,llama-${{ needs.tag.outputs.name }}," -C ./build/bin .
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-${{ needs.tag.outputs.name }}-bin-macos-${{ matrix.build }}.tar.gz
+          name: llama-bin-macos-${{ matrix.build }}.tar.gz
+
+  ubuntu-vulkan:
+    needs: [tag]
+    strategy:
+      matrix:
+        include:
+          - build: 'x64'
+            os: ubuntu-22.04
+          - build: 'arm64'
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Dependencies
+        run: |
+          if [[ "${{ matrix.os }}" =~ "ubuntu-22.04" ]]; then
+            wget -qO - https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo apt-key add -
+            sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-jammy.list https://packages.lunarg.com/vulkan/lunarg-vulkan-jammy.list
+            sudo apt-get update -y
+            sudo apt-get install -y build-essential mesa-vulkan-drivers vulkan-sdk libssl-dev
+          else
+            sudo apt-get update -y
+            sudo apt-get install -y gcc-14 g++-14 build-essential glslc libvulkan-dev spirv-headers libssl-dev ninja-build
+            echo "CC=gcc-14" >> "$GITHUB_ENV"
+            echo "CXX=g++-14" >> "$GITHUB_ENV"
+          fi
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: premise-release-${{ matrix.os }}-vulkan
+
+      - name: Build
+        run: |
+          cmake -B build \
+            -DCMAKE_INSTALL_RPATH='$ORIGIN' \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ALL_VARIANTS=ON \
+            -DGGML_VULKAN=ON \
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release -j $(nproc)
+
+      - name: Pack artifacts
+        run: |
+          cp LICENSE ./build/bin/
+          tar -czvf llama-${{ needs.tag.outputs.name }}-bin-ubuntu-vulkan-${{ matrix.build }}.tar.gz --transform "s,^\.,llama-${{ needs.tag.outputs.name }}," -C ./build/bin .
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-${{ needs.tag.outputs.name }}-bin-ubuntu-vulkan-${{ matrix.build }}.tar.gz
+          name: llama-bin-ubuntu-vulkan-${{ matrix.build }}.tar.gz
+
+  windows-vulkan-x64:
+    needs: [tag]
+    runs-on: windows-2025
+    env:
+      VULKAN_VERSION: 1.4.313.2
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Vulkan SDK
+        run: |
+          curl.exe -o $env:RUNNER_TEMP/VulkanSDK-Installer.exe -L "https://sdk.lunarg.com/sdk/download/${env:VULKAN_VERSION}/windows/vulkansdk-windows-X64-${env:VULKAN_VERSION}.exe"
+          & "$env:RUNNER_TEMP\VulkanSDK-Installer.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\${env:VULKAN_VERSION}"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\${env:VULKAN_VERSION}\bin"
+
+      - name: Build
+        run: |
+          cmake -S . -B build `
+            -DGGML_VULKAN=ON `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_NATIVE=OFF `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DLLAMA_BUILD_BORINGSSL=ON `
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release -j ${env:NUMBER_OF_PROCESSORS}
+
+      - name: Pack artifacts
+        run: |
+          Copy-Item LICENSE .\build\bin\Release\
+          7z a -snl llama-${{ needs.tag.outputs.name }}-bin-win-vulkan-x64.zip .\build\bin\Release\*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-${{ needs.tag.outputs.name }}-bin-win-vulkan-x64.zip
+          name: llama-bin-win-vulkan-x64.zip
+
+  windows-cpu-arm64:
+    needs: [tag]
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Ninja
+        run: |
+          choco install ninja
+
+      # OpenMP is disabled to avoid shipping the MSVC LLVM OpenMP redist DLL,
+      # whose install path is hardcoded per VS image version upstream. ggml
+      # falls back to its own threadpool.
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" amd64_arm64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -D CMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_CPU_ALL_VARIANTS=OFF ^
+            -DGGML_OPENMP=OFF ^
+            ${{ env.CMAKE_ARGS }}
+          cmake --build build --config Release
+
+      - name: Pack artifacts
+        run: |
+          Copy-Item LICENSE .\build\bin\Release\
+          7z a -snl llama-${{ needs.tag.outputs.name }}-bin-win-cpu-arm64.zip .\build\bin\Release\*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-${{ needs.tag.outputs.name }}-bin-win-cpu-arm64.zip
+          name: llama-bin-win-cpu-arm64.zip
+
+  release:
+    needs: [tag, macos, ubuntu-vulkan, windows-vulkan-x64, windows-cpu-arm64]
+    if: ${{ github.ref_type == 'tag' || inputs.create_release }}
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          path: ./artifact
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.tag.outputs.name }}
+        run: |
+          gh release create "$TAG" artifact/* \
+            --repo "${{ github.repository }}" \
+            --target "${{ github.sha }}" \
+            --title "$TAG" \
+            --notes "llama-server + premise-server builds for CanonicalDrafter (see tools/premise-server)."
