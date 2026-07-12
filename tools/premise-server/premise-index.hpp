@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -11,11 +12,18 @@
 #include <vector>
 #include "json.hpp"
 
+#ifdef LLAMA_PREMISE_USE_FAISS
+#include <faiss/IndexFlat.h>
+#endif
+
 struct PremiseIndex {
     int n_premises = 0;
     int dim        = 0;
     std::vector<float>       vectors;  // [n_premises * dim], row-major, L2-normalised
     std::vector<std::string> strings;
+#ifdef LLAMA_PREMISE_USE_FAISS
+    std::unique_ptr<faiss::IndexFlatIP> faiss_index;
+#endif
 
     void load(const char * vec_path, const char * str_path, int max_premises = 0) {
         // Load premise strings
@@ -45,13 +53,41 @@ struct PremiseIndex {
         if ((int)strings.size() < n_premises) {
             throw std::runtime_error("premise_strings.json has fewer entries than premise_vectors.bin");
         }
-        fprintf(stderr, "premise index: %d premises, dim=%d\n", n_premises, dim);
+#ifdef LLAMA_PREMISE_USE_FAISS
+        faiss_index = std::make_unique<faiss::IndexFlatIP>(dim);
+        if (n_premises > 0) {
+            faiss_index->add(n_premises, vectors.data());
+        }
+        fprintf(stderr, "premise index: %d premises, dim=%d, backend=faiss\n", n_premises, dim);
+#else
+        fprintf(stderr, "premise index: %d premises, dim=%d, backend=bruteforce\n", n_premises, dim);
+#endif
     }
 
     // Brute-force cosine similarity (inner product on L2-normalised vectors).
     // Returns top_k (premise_string, score) pairs, sorted by descending score.
     std::vector<std::pair<std::string, float>>
     search(const float * query, int top_k) const {
+        int k = std::min(top_k, n_premises);
+        if (k <= 0) {
+            return {};
+        }
+#ifdef LLAMA_PREMISE_USE_FAISS
+        if (faiss_index) {
+            std::vector<float> scores(k);
+            std::vector<faiss::idx_t> labels(k);
+            faiss_index->search(1, query, k, scores.data(), labels.data());
+
+            std::vector<std::pair<std::string, float>> out;
+            out.reserve(k);
+            for (int i = 0; i < k; ++i) {
+                if (labels[i] >= 0 && labels[i] < (faiss::idx_t) strings.size()) {
+                    out.push_back({strings[(size_t) labels[i]], scores[i]});
+                }
+            }
+            return out;
+        }
+#endif
         std::vector<std::pair<float, int>> scores(n_premises);
         for (int i = 0; i < n_premises; ++i) {
             float dot = 0.0f;
@@ -59,7 +95,6 @@ struct PremiseIndex {
             for (int d = 0; d < dim; ++d) dot += query[d] * row[d];
             scores[i] = {dot, i};
         }
-        int k = std::min(top_k, n_premises);
         std::partial_sort(scores.begin(), scores.begin() + k, scores.end(),
                           [](const auto & a, const auto & b){ return a.first > b.first; });
         std::vector<std::pair<std::string, float>> out;
