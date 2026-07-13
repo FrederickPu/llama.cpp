@@ -5,7 +5,7 @@ The premise-server is the embedding-only server used by CanonicalDrafter to
 rank Lean premises. It does not generate text. The intended flow is:
 
   1. Start premise-server with a GGUF embedding model.
-  2. Pass --index-vecs and --index-strings so declaration embeddings persist.
+  2. Pass --index-vecs and --index-names so declaration embeddings persist.
   3. Ask /version whether a Lean module is already cached in this process.
   4. Send declarations to /cache when the version token is missing or stale.
   5. Call /select with imports, local declarations, a goal, and k.
@@ -50,7 +50,7 @@ CMAKE_CONFIGURE_ARGS = [
 
 DEFAULT_MODEL = Path("D:/hparam_outputs/thomas-zhu-lean-premise.f16.gguf")
 DEFAULT_INDEX_VECS = BUILD_DIR / "premise-demo-vectors.bin"
-DEFAULT_INDEX_STRINGS = BUILD_DIR / "premise-demo-strings.json"
+DEFAULT_INDEX_NAMES = BUILD_DIR / "premise-demo-names.bin"
 THOMAS_ZHU_MODEL_ID = "l3lab/all-distilroberta-v1-lr2e-4-bs256-nneg3-ml-ne2"
 THOMAS_ZHU_MODEL_REVISION = "v4.30.0"
 
@@ -121,7 +121,7 @@ def premise_server_command(args: argparse.Namespace) -> list[str]:
         "--ctx-size", str(args.ctx_size),
         "--parallel", str(args.parallel),
         "--index-vecs", str(args.index_vecs),
-        "--index-strings", str(args.index_strings),
+        "--index-names", str(args.index_names),
     ]
     command.extend(args.server_arg or [])
     return command
@@ -140,7 +140,7 @@ class ManagedPremiseServer:
                 f"Expected Thomas Zhu model: {THOMAS_ZHU_MODEL_ID} revision {THOMAS_ZHU_MODEL_REVISION}"
             )
         self.args.index_vecs.parent.mkdir(parents=True, exist_ok=True)
-        self.args.index_strings.parent.mkdir(parents=True, exist_ok=True)
+        self.args.index_names.parent.mkdir(parents=True, exist_ok=True)
 
         env = os.environ.copy()
         if BUILD_BIN_DIR.exists():
@@ -301,14 +301,16 @@ Build
 Start
 -----
 
-The --index-vecs and --index-strings files are a persistent decl-string to
-embedding cache. Keep them across restarts so /cache does not re-embed every
-declaration each time the server starts.
+The --index-vecs file stores packed float embeddings. The --index-names file
+is compact binary metadata grouped by defining module: module token, imports,
+and declaration names. Its declaration order is the row order in --index-vecs.
+Pretty-printed declaration strings are sent by Lean only when embeddings need to
+be recomputed; they are not persisted.
 
    {premise_server_exe} --host {args.host} --port {args.port} --model {args.model} {line_continue}
        --pooling {args.pooling} --ctx-size {args.ctx_size} --parallel {args.parallel} {line_continue}
        --index-vecs {args.index_vecs} {line_continue}
-       --index-strings {args.index_strings}
+       --index-names {args.index_names}
 
 API
 ---
@@ -359,8 +361,11 @@ Notes
 -----
 
   - /version is an in-memory module freshness check; it resets on restart.
-  - --index-vecs/--index-strings persist declaration embeddings on disk, not
-    module version tokens.
+  - --index-vecs/--index-names persist embeddings and module version tokens on
+    disk, but not declaration strings.
+  - Lean decides which declarations belong to each module and sends fully
+    qualified names through /cache; premise-server does not infer module
+    membership itself.
   - --parallel controls how many embedding contexts premise-server can use.
   - /select can include unsaved local declarations in the request body.
   - --url runs the same /version, /cache, and /select demo against an existing
@@ -389,7 +394,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ctx-size", type=int, default=512)
     parser.add_argument("--parallel", type=int, default=2, help="Number of embedding contexts used by premise-server")
     parser.add_argument("--index-vecs", type=Path, default=DEFAULT_INDEX_VECS, help="Persistent embedding vector cache")
-    parser.add_argument("--index-strings", type=Path, default=DEFAULT_INDEX_STRINGS, help="Persistent declaration string cache")
+    parser.add_argument("--index-names", dest="index_names", type=Path, default=DEFAULT_INDEX_NAMES, help="Persistent module/declaration-name metadata cache")
+    parser.add_argument("--index-strings", dest="index_names", type=Path, help="Deprecated alias for --index-names")
     parser.add_argument("--startup-timeout", type=int, default=180)
     parser.add_argument("--server-bin", type=Path, help="Path to premise-server executable")
     parser.add_argument("--server-log", type=Path)

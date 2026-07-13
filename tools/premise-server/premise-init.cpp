@@ -22,7 +22,7 @@ void premise_setup(server_context & ctx_server,
     }
 
     if (premise_vec_path.empty() != premise_str_path.empty()) {
-        SRV_WRN("%s", "joint retrieval: --index-vecs and --index-strings must be provided together; offline index disabled\n");
+        SRV_WRN("%s", "joint retrieval: --index-vecs and --index-names must be provided together; offline index disabled\n");
     }
 
     auto * gen_ctx = ctx_server.get_llama_context();
@@ -100,6 +100,23 @@ void premise_setup(server_context & ctx_server,
         js->embedding_dim = embedding_dim;
         js->embed_cache = std::move(embed_cache);
         js->premise_index = std::move(premise_index);
+
+        if (js->embed_cache) {
+            for (const auto & snap : js->embed_cache->snapshot_modules()) {
+                LeanModuleCacheEntry entry;
+                entry.version_token = snap.version_token;
+                entry.imports = snap.imports;
+                entry.declarations.reserve(snap.declarations.size());
+                for (const auto & decl : snap.declarations) {
+                    LeanPremiseRecord record;
+                    record.name = decl.first;
+                    record.module = snap.module;
+                    record.embedding = decl.second;
+                    entry.declarations.push_back(std::move(record));
+                }
+                js->module_cache[snap.module] = std::move(entry);
+            }
+        }
 
         g_premise_state = js.release();
         const int n_premises = g_premise_state->premise_index ? g_premise_state->premise_index->n_premises : 0;

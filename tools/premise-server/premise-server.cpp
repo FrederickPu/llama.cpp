@@ -43,15 +43,15 @@ int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
     std::string premise_vec_path;
-    std::string premise_str_path;
+    std::string premise_meta_path;
     std::vector<char *> filtered_args;
     filtered_args.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--index-vecs" && i + 1 < argc) {
             premise_vec_path = argv[++i];
-        } else if (a == "--index-strings" && i + 1 < argc) {
-            premise_str_path = argv[++i];
+        } else if ((a == "--index-names" || a == "--index-strings") && i + 1 < argc) {
+            premise_meta_path = argv[++i];
         } else if (a == "--no-joint") {
             // Accepted for compatibility with older local commands.
         } else {
@@ -120,7 +120,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    premise_setup(ctx_server, premise_vec_path, premise_str_path, PremiseMode::Embedding, params.n_parallel);
+    premise_setup(ctx_server, premise_vec_path, premise_meta_path, PremiseMode::Embedding, params.n_parallel);
     ctx_http.is_ready.store(true);
     SRV_INF("server is listening on %s\n", ctx_http.listening_address.c_str());
 

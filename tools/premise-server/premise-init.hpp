@@ -9,7 +9,7 @@ enum class PremiseMode {
     Embedding,
 };
 
-// Initialize g_premise_state from --index-vecs / --index-strings paths or, when
+// Initialize g_premise_state from --index-vecs / --index-names paths or, when
 // requested, as a cache/select-only embedding premise server.
 // Must be called after ctx_server.load_model() succeeds.
 void premise_setup(server_context & ctx_server,

@@ -84,7 +84,7 @@ int llama_server(int argc, char ** argv) {
     // Strip our custom flags before common_params_parse sees them.
     // common_params_parse fails on unknown flags, so we pull out ours first.
     std::string joint_vec_path;
-    std::string joint_str_path;
+    std::string joint_meta_path;
     PremiseMode premise_mode = PremiseMode::Auto;
     std::vector<char *> filtered_args;
     {
@@ -93,8 +93,8 @@ int llama_server(int argc, char ** argv) {
             std::string a = argv[i];
             if (a == "--index-vecs" && i + 1 < argc) {
                 joint_vec_path = argv[++i];
-            } else if (a == "--index-strings" && i + 1 < argc) {
-                joint_str_path = argv[++i];
+            } else if ((a == "--index-names" || a == "--index-strings") && i + 1 < argc) {
+                joint_meta_path = argv[++i];
             } else if (a == "--joint") {
                 premise_mode = PremiseMode::Joint;
             } else if (a == "--no-joint") {
@@ -316,7 +316,7 @@ int llama_server(int argc, char ** argv) {
         }
 
         // joint: initialize premise index and embedding context
-        premise_setup(ctx_server, joint_vec_path, joint_str_path, premise_mode, params.n_parallel);
+        premise_setup(ctx_server, joint_vec_path, joint_meta_path, premise_mode, params.n_parallel);
 
         routes.update_meta(ctx_server);
         ctx_http.is_ready.store(true);

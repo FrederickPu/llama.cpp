@@ -213,7 +213,6 @@ static std::vector<float> embed_text(const std::string & text, bool append_emb) 
 static std::vector<LeanPremiseRecord> embed_declarations(
         const std::vector<LeanDeclaration> & declarations,
         const std::string & module) {
-    auto * cache = g_premise_state ? g_premise_state->embed_cache.get() : nullptr;
     std::vector<LeanPremiseRecord> out(declarations.size());
     std::vector<size_t> missing;
     missing.reserve(declarations.size());
@@ -223,9 +222,6 @@ static std::vector<LeanPremiseRecord> embed_declarations(
         out[i].name = decl.name;
         out[i].decl = decl.decl;
         out[i].module = module;
-        if (cache && cache->find(decl.decl, out[i].embedding)) {
-            continue;
-        }
         missing.push_back(i);
     }
 
@@ -248,9 +244,6 @@ static std::vector<LeanPremiseRecord> embed_declarations(
             const size_t index = missing[pos];
             try {
                 out[index].embedding = embed_text(out[index].decl, false);
-                if (cache) {
-                    cache->insert(out[index].decl, out[index].embedding);
-                }
             } catch (...) {
                 std::lock_guard<std::mutex> lk(error_mu);
                 if (!error) {
@@ -490,10 +483,31 @@ json premise_cache_module(const json & data) {
         throw std::runtime_error("missing token");
     }
 
+    {
+        std::lock_guard<std::mutex> lk(g_premise_state->cache_mu);
+        auto it = g_premise_state->module_cache.find(module);
+        if (it != g_premise_state->module_cache.end() && it->second.version_token == token) {
+            return json{{"ok", true}};
+        }
+    }
+
+    const std::vector<std::string> imports = parse_string_array(data, "imports");
     LeanModuleCacheEntry entry;
     entry.version_token = token;
-    entry.imports = parse_string_array(data, "imports");
+    entry.imports = imports;
     entry.declarations = embed_declarations(parse_declarations(data), module);
+
+    if (g_premise_state->embed_cache) {
+        std::vector<std::string> names;
+        std::vector<std::vector<float>> embeddings;
+        names.reserve(entry.declarations.size());
+        embeddings.reserve(entry.declarations.size());
+        for (const auto & decl : entry.declarations) {
+            names.push_back(decl.name);
+            embeddings.push_back(decl.embedding);
+        }
+        g_premise_state->embed_cache->replace_module(module, token, imports, names, embeddings);
+    }
 
     {
         std::lock_guard<std::mutex> lk(g_premise_state->cache_mu);
