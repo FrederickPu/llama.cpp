@@ -72,6 +72,11 @@ void premise_setup(server_context & ctx_server,
         std::unique_ptr<PremiseEmbedCache> embed_cache;
         std::unique_ptr<PremiseIndex> premise_index;
 
+        if (premise_mode == PremiseMode::Embedding) {
+            premise_index = std::make_unique<PremiseIndex>();
+            premise_index->init_empty(embedding_dim);
+        }
+
         if (has_index_paths && premise_mode == PremiseMode::Embedding) {
             // cache/select mode: the index paths name a persistent embedding
             // cache that this server creates and updates itself, so missing
@@ -101,20 +106,18 @@ void premise_setup(server_context & ctx_server,
         js->embed_cache = std::move(embed_cache);
         js->premise_index = std::move(premise_index);
 
-        if (js->embed_cache) {
+        if (js->embed_cache && js->premise_index) {
             for (const auto & snap : js->embed_cache->snapshot_modules()) {
-                LeanModuleCacheEntry entry;
-                entry.version_token = snap.version_token;
-                entry.imports = snap.imports;
-                entry.declarations.reserve(snap.declarations.size());
+                std::vector<PremiseIndex::Record> declarations;
+                declarations.reserve(snap.declarations.size());
                 for (const auto & decl : snap.declarations) {
-                    LeanPremiseRecord record;
+                    PremiseIndex::Record record;
                     record.name = decl.first;
                     record.module = snap.module;
                     record.embedding = decl.second;
-                    entry.declarations.push_back(std::move(record));
+                    declarations.push_back(std::move(record));
                 }
-                js->module_cache[snap.module] = std::move(entry);
+                js->premise_index->replace_module(snap.module, snap.version_token, snap.imports, declarations);
             }
         }
 

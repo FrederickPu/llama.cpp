@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include "json.hpp"
 
@@ -19,15 +20,51 @@
 #endif
 
 struct PremiseIndex {
+    struct Record {
+        std::string name;
+        std::string decl;
+        std::string module;
+        std::vector<float> embedding;
+    };
+
+    struct Hit {
+        std::string name;
+        std::string statement;
+        std::string decl;
+        std::string module;
+        float score = 0.0f;
+    };
+
+    struct ModuleMeta {
+        std::string version_token;
+        std::vector<std::string> imports;
+        std::vector<size_t> rows;
+    };
+
     int n_premises = 0;
     int dim        = 0;
     std::vector<float>       vectors;  // [n_premises * dim], row-major, L2-normalised
     std::vector<std::string> strings;
+    std::vector<Record>      records;
+    std::unordered_map<std::string, ModuleMeta> modules;
+    mutable std::mutex       mu;
 #ifdef LLAMA_PREMISE_USE_FAISS
     std::unique_ptr<faiss::IndexFlatIP> faiss_index;
 #endif
 
+    void init_empty(int model_dim) {
+        std::lock_guard<std::mutex> lk(mu);
+        n_premises = 0;
+        dim = model_dim;
+        vectors.clear();
+        strings.clear();
+        records.clear();
+        modules.clear();
+        rebuild_vector_index_locked();
+    }
+
     void load(const char * vec_path, const char * str_path, int max_premises = 0) {
+        std::lock_guard<std::mutex> lk(mu);
         // Load premise strings
         {
             std::ifstream f(str_path);
@@ -55,21 +92,102 @@ struct PremiseIndex {
         if ((int)strings.size() < n_premises) {
             throw std::runtime_error("premise metadata has fewer entries than premise_vectors.bin");
         }
-#ifdef LLAMA_PREMISE_USE_FAISS
-        faiss_index = std::make_unique<faiss::IndexFlatIP>(dim);
-        if (n_premises > 0) {
-            faiss_index->add(n_premises, vectors.data());
+
+        records.clear();
+        records.reserve(strings.size());
+        for (int i = 0; i < n_premises; ++i) {
+            const float * row = vectors.data() + (size_t) i * dim;
+            records.push_back({"", strings[(size_t) i], "", std::vector<float>(row, row + dim)});
         }
+
+        rebuild_vector_index_locked();
+#ifdef LLAMA_PREMISE_USE_FAISS
         fprintf(stderr, "premise index: %d premises, dim=%d, backend=faiss\n", n_premises, dim);
 #else
         fprintf(stderr, "premise index: %d premises, dim=%d, backend=bruteforce\n", n_premises, dim);
 #endif
     }
 
+    std::string module_version(const std::string & module) const {
+        std::lock_guard<std::mutex> lk(mu);
+        auto it = modules.find(module);
+        return it == modules.end() ? std::string() : it->second.version_token;
+    }
+
+    std::unordered_map<std::string, std::string> module_versions(const std::vector<std::string> & names) const {
+        std::lock_guard<std::mutex> lk(mu);
+        std::unordered_map<std::string, std::string> out;
+        for (const auto & module : names) {
+            auto it = modules.find(module);
+            if (it != modules.end()) {
+                out[module] = it->second.version_token;
+            }
+        }
+        return out;
+    }
+
+    void replace_module(const std::string & module,
+                        const std::string & token,
+                        const std::vector<std::string> & imports,
+                        const std::vector<Record> & declarations) {
+        std::lock_guard<std::mutex> lk(mu);
+        int next_dim = dim;
+        std::vector<Record> module_records;
+        module_records.reserve(declarations.size());
+        std::unordered_set<std::string> seen_names;
+        for (auto decl : declarations) {
+            if (!decl.name.empty() && !seen_names.insert(decl.name).second) {
+                continue;
+            }
+            if (next_dim == 0) {
+                next_dim = (int) decl.embedding.size();
+            }
+            if ((int) decl.embedding.size() != next_dim) {
+                throw std::runtime_error("premise embedding dimension mismatch");
+            }
+            decl.module = module;
+            module_records.push_back(std::move(decl));
+        }
+
+        std::vector<Record> next_records;
+        next_records.reserve(records.size() + module_records.size());
+        std::unordered_map<std::string, ModuleMeta> next_modules;
+
+        for (auto & record : records) {
+            if (record.module == module) {
+                continue;
+            }
+            auto old_meta = modules.find(record.module);
+            if (old_meta != modules.end()) {
+                auto & meta = next_modules[record.module];
+                meta.version_token = old_meta->second.version_token;
+                meta.imports = old_meta->second.imports;
+                meta.rows.push_back(next_records.size());
+            }
+            next_records.push_back(std::move(record));
+        }
+
+        ModuleMeta meta;
+        meta.version_token = token;
+        meta.imports = imports;
+        for (auto & decl : module_records) {
+            meta.rows.push_back(next_records.size());
+            next_records.push_back(std::move(decl));
+        }
+        next_modules[module] = std::move(meta);
+
+        dim = next_dim;
+        records = std::move(next_records);
+        modules = std::move(next_modules);
+        rebuild_vectors_locked();
+        rebuild_vector_index_locked();
+    }
+
     // Brute-force cosine similarity (inner product on L2-normalised vectors).
-    // Returns top_k (premise_string, score) pairs, sorted by descending score.
-    std::vector<std::pair<std::string, float>>
+    // Returns top_k hits sorted by descending score.
+    std::vector<Hit>
     search(const float * query, int top_k) const {
+        std::lock_guard<std::mutex> lk(mu);
         int k = std::min(top_k, n_premises);
         if (k <= 0) {
             return {};
@@ -80,11 +198,11 @@ struct PremiseIndex {
             std::vector<faiss::idx_t> labels(k);
             faiss_index->search(1, query, k, scores.data(), labels.data());
 
-            std::vector<std::pair<std::string, float>> out;
+            std::vector<Hit> out;
             out.reserve(k);
             for (int i = 0; i < k; ++i) {
-                if (labels[i] >= 0 && labels[i] < (faiss::idx_t) strings.size()) {
-                    out.push_back({strings[(size_t) labels[i]], scores[i]});
+                if (labels[i] >= 0 && labels[i] < (faiss::idx_t) records.size()) {
+                    out.push_back(make_hit_locked((size_t) labels[i], scores[i]));
                 }
             }
             return out;
@@ -99,11 +217,120 @@ struct PremiseIndex {
         }
         std::partial_sort(scores.begin(), scores.begin() + k, scores.end(),
                           [](const auto & a, const auto & b){ return a.first > b.first; });
-        std::vector<std::pair<std::string, float>> out;
+        std::vector<Hit> out;
         out.reserve(k);
         for (int i = 0; i < k; ++i)
-            out.push_back({strings[scores[i].second], scores[i].first});
+            out.push_back(make_hit_locked((size_t) scores[i].second, scores[i].first));
         return out;
+    }
+
+    std::vector<Hit> search(const float * query,
+                            const std::vector<std::string> & imports,
+                            const std::vector<Record> & local,
+                            int top_k) const {
+        struct ScoredHit {
+            float score;
+            Hit hit;
+        };
+
+        std::lock_guard<std::mutex> lk(mu);
+        std::vector<size_t> rows;
+        std::unordered_set<std::string> visited_modules;
+        std::unordered_set<std::string> seen_names;
+        for (const auto & module : imports) {
+            collect_module_rows_locked(module, visited_modules, seen_names, rows);
+        }
+
+        std::vector<ScoredHit> scored;
+        scored.reserve(rows.size() + local.size());
+        for (size_t row : rows) {
+            scored.push_back({score_row_locked(query, row), make_hit_locked(row, 0.0f)});
+            scored.back().hit.score = scored.back().score;
+        }
+        for (const auto & record : local) {
+            if (!record.name.empty() && !seen_names.insert(record.name).second) {
+                continue;
+            }
+            if ((int) record.embedding.size() != dim) {
+                continue;
+            }
+            float score = 0.0f;
+            for (int i = 0; i < dim; ++i) {
+                score += query[i] * record.embedding[(size_t) i];
+            }
+            scored.push_back({score, {record.name, record.decl, record.decl, record.module, score}});
+        }
+
+        int k = std::min(top_k, (int) scored.size());
+        if (k <= 0) {
+            return {};
+        }
+        std::partial_sort(scored.begin(), scored.begin() + k, scored.end(),
+                [](const ScoredHit & a, const ScoredHit & b) { return a.score > b.score; });
+
+        std::vector<Hit> out;
+        out.reserve(k);
+        for (int i = 0; i < k; ++i) {
+            out.push_back(std::move(scored[(size_t) i].hit));
+        }
+        return out;
+    }
+
+private:
+    void rebuild_vectors_locked() {
+        n_premises = (int) records.size();
+        vectors.clear();
+        strings.clear();
+        vectors.reserve((size_t) n_premises * dim);
+        strings.reserve(records.size());
+        for (const auto & record : records) {
+            strings.push_back(record.decl);
+            vectors.insert(vectors.end(), record.embedding.begin(), record.embedding.end());
+        }
+    }
+
+    void rebuild_vector_index_locked() {
+#ifdef LLAMA_PREMISE_USE_FAISS
+        faiss_index = dim > 0 ? std::make_unique<faiss::IndexFlatIP>(dim) : nullptr;
+        if (faiss_index && n_premises > 0) {
+            faiss_index->add(n_premises, vectors.data());
+        }
+#endif
+    }
+
+    float score_row_locked(const float * query, size_t row) const {
+        float dot = 0.0f;
+        const float * vec = vectors.data() + row * (size_t) dim;
+        for (int i = 0; i < dim; ++i) {
+            dot += query[i] * vec[i];
+        }
+        return dot;
+    }
+
+    Hit make_hit_locked(size_t row, float score) const {
+        const auto & record = records[row];
+        return {record.name, record.decl, record.decl, record.module, score};
+    }
+
+    void collect_module_rows_locked(const std::string & module,
+                                    std::unordered_set<std::string> & visited_modules,
+                                    std::unordered_set<std::string> & seen_names,
+                                    std::vector<size_t> & out) const {
+        if (!visited_modules.insert(module).second) {
+            return;
+        }
+        auto it = modules.find(module);
+        if (it == modules.end()) {
+            return;
+        }
+        for (const auto & imported : it->second.imports) {
+            collect_module_rows_locked(imported, visited_modules, seen_names, out);
+        }
+        for (size_t row : it->second.rows) {
+            if (row < records.size() && (records[row].name.empty() || seen_names.insert(records[row].name).second)) {
+                out.push_back(row);
+            }
+        }
     }
 };
 
@@ -162,6 +389,7 @@ struct PremiseEmbedCache {
     std::unordered_map<std::string, size_t>  index;   // module + name -> row
     std::unordered_map<std::string, ModuleMeta> modules;
     size_t n_dirty = 0;
+    bool metadata_dirty = false;
     std::chrono::steady_clock::time_point last_save = std::chrono::steady_clock::now();
 
     static std::string key(const std::string & module, const std::string & name) {
@@ -275,6 +503,7 @@ struct PremiseEmbedCache {
         }
         if (entries.size() != loaded.size() || (int32_t) count != n) {
             n_dirty = entries.size();
+            metadata_dirty = true;
         }
         fprintf(stderr, "premise cache: loaded %zu embeddings from %s\n", entries.size(), vec_path.c_str());
     }
@@ -352,12 +581,16 @@ struct PremiseEmbedCache {
         entries = std::move(next);
         index = std::move(next_index);
         modules = std::move(next_modules);
-        n_dirty = entries.size();
+        metadata_dirty = true;
+        n_dirty += names.size();
+        if (n_dirty > entries.size()) {
+            n_dirty = entries.size();
+        }
     }
 
     void maybe_save(bool force) {
         std::lock_guard<std::mutex> lk(mu);
-        if (n_dirty == 0 || vec_path.empty() || meta_path.empty()) {
+        if ((n_dirty == 0 && !metadata_dirty) || vec_path.empty() || meta_path.empty()) {
             return;
         }
         const auto now = std::chrono::steady_clock::now();
@@ -375,18 +608,21 @@ struct PremiseEmbedCache {
             }
         }
 
+        const bool write_vectors = n_dirty > 0;
         const std::string vec_tmp = vec_path + ".tmp";
-        FILE * f = fopen(vec_tmp.c_str(), "wb");
-        if (!f) {
-            fprintf(stderr, "premise cache: cannot write %s\n", vec_tmp.c_str());
-            return;
+        if (write_vectors) {
+            FILE * f = fopen(vec_tmp.c_str(), "wb");
+            if (!f) {
+                fprintf(stderr, "premise cache: cannot write %s\n", vec_tmp.c_str());
+                return;
+            }
+            int32_t header[2] = { (int32_t) save_rows.size(), (int32_t) dim };
+            fwrite(header, sizeof(header), 1, f);
+            for (size_t row : save_rows) {
+                fwrite(entries[row].embedding.data(), sizeof(float), (size_t) dim, f);
+            }
+            fclose(f);
         }
-        int32_t header[2] = { (int32_t) save_rows.size(), (int32_t) dim };
-        fwrite(header, sizeof(header), 1, f);
-        for (size_t row : save_rows) {
-            fwrite(entries[row].embedding.data(), sizeof(float), (size_t) dim, f);
-        }
-        fclose(f);
 
         const std::string meta_tmp = meta_path + ".tmp";
         std::ofstream fs(meta_tmp, std::ios::binary | std::ios::trunc);
@@ -415,17 +651,22 @@ struct PremiseEmbedCache {
         fs.close();
         if (!fs) {
             fprintf(stderr, "premise cache: cannot write %s\n", meta_tmp.c_str());
-            std::remove(vec_tmp.c_str());
+            if (write_vectors) {
+                std::remove(vec_tmp.c_str());
+            }
             return;
         }
 
-        std::remove(vec_path.c_str()); // Windows rename does not overwrite
-        std::rename(vec_tmp.c_str(), vec_path.c_str());
+        if (write_vectors) {
+            std::remove(vec_path.c_str()); // Windows rename does not overwrite
+            std::rename(vec_tmp.c_str(), vec_path.c_str());
+        }
         std::remove(meta_path.c_str());
         std::rename(meta_tmp.c_str(), meta_path.c_str());
 
         fprintf(stderr, "premise cache: saved %zu embeddings\n", entries.size());
         n_dirty = 0;
+        metadata_dirty = false;
         last_save = now;
     }
 };

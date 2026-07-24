@@ -6,26 +6,12 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_set>
 #include <unordered_map>
 #include <vector>
 
 struct LeanDeclaration {
     std::string name;
     std::string decl;
-};
-
-struct LeanPremiseRecord {
-    std::string name;
-    std::string decl;
-    std::string module;
-    std::vector<float> embedding;
-};
-
-struct LeanModuleCacheEntry {
-    std::string version_token;
-    std::vector<std::string> imports;
-    std::vector<LeanPremiseRecord> declarations;
 };
 
 struct PremiseRetrievalRequest {
@@ -50,8 +36,6 @@ struct PremiseRetrievalState {
 
     std::mutex emb_mu;
     std::condition_variable emb_cv;
-    std::mutex cache_mu;
-    std::unordered_map<std::string, LeanModuleCacheEntry> module_cache;
 
     // pending_premises and task_topk are written by the server loop thread and read
     // by the HTTP handler thread, so they share a mutex.
@@ -67,6 +51,9 @@ std::string premise_task_created(int task_id, const nlohmann::ordered_json & dat
 void premise_prefill_complete(int task_id, const std::vector<llama_token> & prompt_tokens);
 std::string premise_take_initial_stream_prefix(int task_id);
 
-nlohmann::ordered_json premise_get_module_version(const nlohmann::ordered_json & data);
-nlohmann::ordered_json premise_cache_module(const nlohmann::ordered_json & data);
-nlohmann::ordered_json premise_retrieve(const nlohmann::ordered_json & data);
+nlohmann::ordered_json premise_api_version(const nlohmann::ordered_json & data);
+nlohmann::ordered_json premise_api_cache(const nlohmann::ordered_json & data);
+nlohmann::ordered_json premise_api_select(const nlohmann::ordered_json & data);
+
+nlohmann::ordered_json premise_api_version_batch(const nlohmann::ordered_json & data);
+nlohmann::ordered_json premise_api_cache_batch(const nlohmann::ordered_json & data);

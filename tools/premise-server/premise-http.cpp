@@ -20,33 +20,52 @@ static server_http_res_ptr premise_error_response(const std::exception & e) {
     return res;
 }
 
-static server_http_res_ptr premise_handle_module_version(const server_http_req & req) {
+static server_http_res_ptr premise_handle_version(const server_http_req & req) {
     try {
         json body = req.body.empty() ? json::object() : json::parse(req.body);
-        return premise_json_response(premise_get_module_version(body));
+        return premise_json_response(premise_api_version(body));
     } catch (const std::exception & e) {
         return premise_error_response(e);
     }
 }
 
-static server_http_res_ptr premise_handle_cache_module(const server_http_req & req) {
+static server_http_res_ptr premise_handle_cache(const server_http_req & req) {
     try {
-        return premise_json_response(premise_cache_module(json::parse(req.body)));
+        return premise_json_response(premise_api_cache(json::parse(req.body)));
     } catch (const std::exception & e) {
         return premise_error_response(e);
     }
 }
 
-static server_http_res_ptr premise_handle_retrieve(const server_http_req & req) {
+static server_http_res_ptr premise_handle_select(const server_http_req & req) {
     try {
-        return premise_json_response(premise_retrieve(json::parse(req.body)));
+        return premise_json_response(premise_api_select(json::parse(req.body)));
+    } catch (const std::exception & e) {
+        return premise_error_response(e);
+    }
+}
+
+static server_http_res_ptr premise_handle_version_batch(const server_http_req & req) {
+    try {
+        json body = req.body.empty() ? json::object() : json::parse(req.body);
+        return premise_json_response(premise_api_version_batch(body));
+    } catch (const std::exception & e) {
+        return premise_error_response(e);
+    }
+}
+
+static server_http_res_ptr premise_handle_cache_batch(const server_http_req & req) {
+    try {
+        return premise_json_response(premise_api_cache_batch(json::parse(req.body)));
     } catch (const std::exception & e) {
         return premise_error_response(e);
     }
 }
 
 void premise_register_http_routes(const server_http_context & ctx_http) {
-    ctx_http.post("/version", premise_handle_module_version);
-    ctx_http.post("/cache",   premise_handle_cache_module);
-    ctx_http.post("/select",  premise_handle_retrieve);
+    ctx_http.post("/version",       premise_handle_version);
+    ctx_http.post("/version/batch", premise_handle_version_batch);
+    ctx_http.post("/cache",         premise_handle_cache);
+    ctx_http.post("/cache/batch",   premise_handle_cache_batch);
+    ctx_http.post("/select",        premise_handle_select);
 }
