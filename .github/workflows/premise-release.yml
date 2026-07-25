@@ -15,9 +15,8 @@ name: Premise Release
 #   llama-<tag>-bin-win-vulkan-x64.zip
 #   llama-<tag>-bin-win-cpu-arm64.zip
 #
-# Trigger: push a tag named premise-* (the tag becomes the release name and the
-# llamaCppTag constant on the Lean side), or run manually via workflow_dispatch
-# to check the builds without publishing (set create_release to also publish).
+# Trigger: any branch push, a premise-* tag (the tag becomes the release name
+# and the llamaCppTag constant on the Lean side), or workflow_dispatch.
 
 on:
   workflow_dispatch:
@@ -28,6 +27,8 @@ on:
         default: false
         type: boolean
   push:
+    branches:
+      - '**'
     tags:
       - 'premise-*'
 
