@@ -66,6 +66,10 @@ if (WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64|arm64|ARM64)" AND CMAKE_C
     get_target_property(_llama_faiss_compile_definitions faiss COMPILE_DEFINITIONS)
     list(REMOVE_ITEM _llama_faiss_compile_definitions COMPILE_SIMD_ARM_NEON)
     set_property(TARGET faiss PROPERTY COMPILE_DEFINITIONS "${_llama_faiss_compile_definitions}")
+
+    get_target_property(_llama_faiss_sources faiss SOURCES)
+    list(FILTER _llama_faiss_sources EXCLUDE REGEX "(neon|aarch64)\\.cpp$")
+    set_property(TARGET faiss PROPERTY SOURCES "${_llama_faiss_sources}")
 endif()
 
 if (_llama_faiss_restore_blas)
