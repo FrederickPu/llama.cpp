@@ -301,9 +301,9 @@ Build
 Start
 -----
 
-The --index-vecs file stores packed float embeddings. The --index-names file
-is compact binary metadata grouped by defining module: module token, imports,
-and declaration names. Its declaration order is the row order in --index-vecs.
+The --index-vecs file stores a serialized FAISS IndexFlatIP. The --index-names
+file is compact binary metadata grouped by defining module: module token,
+imports, and declaration names. Its declaration order is the FAISS row order.
 Pretty-printed declaration strings are sent by Lean only when embeddings need to
 be recomputed; they are not persisted.
 

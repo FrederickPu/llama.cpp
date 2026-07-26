@@ -1,24 +1,28 @@
 #pragma once
+
+#include "json.hpp"
+
+#include <faiss/IndexFlat.h>
+#include <faiss/index_io.h>
+
 #include <algorithm>
 #include <chrono>
-#include <cmath>
 #include <cstdio>
 #include <cstdint>
-#include <fstream>
 #include <cstring>
+#include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
-#include "json.hpp"
 
-#ifdef LLAMA_PREMISE_USE_FAISS
-#include <faiss/IndexFlat.h>
-#endif
-
+// Owns premise metadata, embeddings, FAISS search, and optional persistence.
+// Cache files contain a FAISS IndexFlatIP and aligned module/name metadata.
 struct PremiseIndex {
     struct Record {
         std::string name;
@@ -42,198 +46,234 @@ struct PremiseIndex {
     };
 
     int n_premises = 0;
-    int dim        = 0;
-    std::vector<float>       vectors;  // [n_premises * dim], row-major, L2-normalised
-    std::vector<std::string> strings;
-    std::vector<Record>      records;
-    std::unordered_map<std::string, ModuleMeta> modules;
-    mutable std::mutex       mu;
-#ifdef LLAMA_PREMISE_USE_FAISS
-    std::unique_ptr<faiss::IndexFlatIP> faiss_index;
-#endif
+    int dim = 0;
 
-    void init_empty(int model_dim) {
-        std::lock_guard<std::mutex> lk(mu);
-        n_premises = 0;
-        dim = model_dim;
-        vectors.clear();
-        strings.clear();
-        records.clear();
-        modules.clear();
-        rebuild_vector_index_locked();
+    void initialize_empty(int model_dim) {
+        std::lock_guard<std::mutex> lock(mu);
+        index_path.clear();
+        metadata_path.clear();
+        reset_locked(model_dim);
     }
 
-    void load(const char * vec_path, const char * str_path, int max_premises = 0) {
-        std::lock_guard<std::mutex> lk(mu);
-        // Load premise strings
-        {
-            std::ifstream f(str_path);
-            if (!f) throw std::runtime_error(std::string("cannot open ") + str_path);
-            nlohmann::json j; f >> j;
-            strings = j.get<std::vector<std::string>>();
+    // Loads an externally generated global index. The JSON array contains the
+    // declaration string aligned with each FAISS row.
+    void load_offline(const char * faiss_path, const char * strings_path, int max_premises = 0) {
+        std::lock_guard<std::mutex> lock(mu);
+        index_path.clear();
+        metadata_path.clear();
+
+        std::ifstream input(strings_path);
+        if (!input) {
+            throw std::runtime_error(std::string("cannot open ") + strings_path);
+        }
+        nlohmann::json json;
+        input >> json;
+        std::vector<std::string> strings = json.get<std::vector<std::string>>();
+
+        auto loaded_index = read_faiss_index(faiss_path);
+        if (loaded_index->ntotal > std::numeric_limits<int>::max()) {
+            throw std::runtime_error("premise index has too many rows");
         }
 
-        // Load premise vectors
-        {
-            std::ifstream f(vec_path, std::ios::binary);
-            if (!f) throw std::runtime_error(std::string("cannot open ") + vec_path);
-            // Header: n_premises (int32), dim (int32)
-            int32_t n, d;
-            f.read(reinterpret_cast<char *>(&n), sizeof(n));
-            f.read(reinterpret_cast<char *>(&d), sizeof(d));
-            n_premises = (max_premises > 0 && max_premises < n) ? max_premises : n;
-            dim        = d;
-            vectors.resize((size_t)n_premises * dim);
-            f.read(reinterpret_cast<char *>(vectors.data()),
-                   (size_t)n_premises * dim * sizeof(float));
-        }
-
-        if ((int)strings.size() > n_premises) strings.resize(n_premises);
-        if ((int)strings.size() < n_premises) {
-            throw std::runtime_error("premise metadata has fewer entries than premise_vectors.bin");
+        dim = (int) loaded_index->d;
+        const int total = (int) loaded_index->ntotal;
+        n_premises = max_premises > 0 ? std::min(max_premises, total) : total;
+        if ((int) strings.size() < n_premises) {
+            throw std::runtime_error("premise metadata has fewer entries than FAISS index");
         }
 
         records.clear();
-        records.reserve(strings.size());
+        records.reserve((size_t) n_premises);
         for (int i = 0; i < n_premises; ++i) {
-            const float * row = vectors.data() + (size_t) i * dim;
-            records.push_back({"", strings[(size_t) i], "", std::vector<float>(row, row + dim)});
+            std::vector<float> embedding((size_t) dim);
+            loaded_index->reconstruct(i, embedding.data());
+            records.push_back({"", std::move(strings[(size_t) i]), "", std::move(embedding)});
         }
+        modules.clear();
 
-        rebuild_vector_index_locked();
-#ifdef LLAMA_PREMISE_USE_FAISS
+        if (n_premises == total) {
+            faiss_index = std::move(loaded_index);
+        } else {
+            rebuild_faiss_index_locked();
+        }
+        dirty = false;
+        unsaved_rows = 0;
         fprintf(stderr, "premise index: %d premises, dim=%d, backend=faiss\n", n_premises, dim);
-#else
-        fprintf(stderr, "premise index: %d premises, dim=%d, backend=bruteforce\n", n_premises, dim);
-#endif
     }
 
-    std::string module_version(const std::string & module) const {
-        std::lock_guard<std::mutex> lk(mu);
+    // Opens the server-managed cache. Missing or invalid files produce an empty
+    // cache; subsequent /cache requests repopulate and persist it.
+    void load_cache(const std::string & faiss_path, const std::string & metadata_file, int model_dim) {
+        std::lock_guard<std::mutex> lock(mu);
+        index_path = faiss_path;
+        metadata_path = metadata_file;
+        reset_locked(model_dim);
+
+        std::ifstream metadata(metadata_file, std::ios::binary);
+        if (!metadata) {
+            fprintf(stderr, "premise cache: starting empty (index files not present yet)\n");
+            return;
+        }
+
+        try {
+            std::unordered_map<std::string, ModuleMeta> loaded_modules;
+            std::vector<std::pair<std::string, std::string>> loaded_names;
+            read_metadata(metadata, loaded_modules, loaded_names);
+
+            auto loaded_index = read_faiss_index(faiss_path.c_str());
+            if ((int) loaded_index->d != model_dim) {
+                throw std::runtime_error("embedding dimension does not match model");
+            }
+
+            const size_t index_rows = (size_t) loaded_index->ntotal;
+            if (index_rows != loaded_names.size()) {
+                throw std::runtime_error("FAISS rows do not match premise metadata");
+            }
+            std::unordered_set<std::string> seen;
+            std::vector<Record> loaded_records;
+            loaded_records.reserve(index_rows);
+            for (auto & item : loaded_modules) {
+                item.second.rows.clear();
+            }
+            for (size_t row = 0; row < index_rows; ++row) {
+                const auto & module = loaded_names[row].first;
+                const auto & name = loaded_names[row].second;
+                if (!seen.insert(module + "\n" + name).second) {
+                    throw std::runtime_error("duplicate declaration in premise metadata");
+                }
+                std::vector<float> embedding((size_t) model_dim);
+                loaded_index->reconstruct((faiss::idx_t) row, embedding.data());
+                loaded_modules[module].rows.push_back(loaded_records.size());
+                loaded_records.push_back({name, "", module, std::move(embedding)});
+            }
+
+            records = std::move(loaded_records);
+            modules = std::move(loaded_modules);
+            n_premises = (int) records.size();
+            faiss_index = std::move(loaded_index);
+            fprintf(stderr, "premise cache: loaded %d embeddings from %s\n", n_premises, faiss_path.c_str());
+        } catch (const std::exception & error) {
+            reset_locked(model_dim);
+            fprintf(stderr, "premise cache: ignoring %s (%s)\n", faiss_path.c_str(), error.what());
+        }
+    }
+
+    std::string get_module_version(const std::string & module) const {
+        std::lock_guard<std::mutex> lock(mu);
         auto it = modules.find(module);
         return it == modules.end() ? std::string() : it->second.version_token;
     }
 
-    std::unordered_map<std::string, std::string> module_versions(const std::vector<std::string> & names) const {
-        std::lock_guard<std::mutex> lk(mu);
-        std::unordered_map<std::string, std::string> out;
+    std::unordered_map<std::string, std::string> get_module_versions(
+            const std::vector<std::string> & names) const {
+        std::lock_guard<std::mutex> lock(mu);
+        std::unordered_map<std::string, std::string> versions;
         for (const auto & module : names) {
             auto it = modules.find(module);
             if (it != modules.end()) {
-                out[module] = it->second.version_token;
+                versions[module] = it->second.version_token;
             }
         }
-        return out;
+        return versions;
     }
 
+    // Atomically replaces every declaration owned by one module and rebuilds
+    // row mappings and the FAISS index.
     void replace_module(const std::string & module,
                         const std::string & token,
                         const std::vector<std::string> & imports,
                         const std::vector<Record> & declarations) {
-        std::lock_guard<std::mutex> lk(mu);
+        std::lock_guard<std::mutex> lock(mu);
         int next_dim = dim;
-        std::vector<Record> module_records;
-        module_records.reserve(declarations.size());
+        std::vector<Record> replacements;
+        replacements.reserve(declarations.size());
         std::unordered_set<std::string> seen_names;
-        for (auto decl : declarations) {
-            if (!decl.name.empty() && !seen_names.insert(decl.name).second) {
+        for (auto declaration : declarations) {
+            if (!declaration.name.empty() && !seen_names.insert(declaration.name).second) {
                 continue;
             }
             if (next_dim == 0) {
-                next_dim = (int) decl.embedding.size();
+                next_dim = (int) declaration.embedding.size();
             }
-            if ((int) decl.embedding.size() != next_dim) {
+            if ((int) declaration.embedding.size() != next_dim) {
                 throw std::runtime_error("premise embedding dimension mismatch");
             }
-            decl.module = module;
-            module_records.push_back(std::move(decl));
+            declaration.module = module;
+            replacements.push_back(std::move(declaration));
+        }
+
+        size_t removed_rows = 0;
+        std::unordered_map<std::string, ModuleMeta> next_modules;
+        for (const auto & item : modules) {
+            if (item.first != module) {
+                next_modules[item.first] = {item.second.version_token, item.second.imports, {}};
+            } else {
+                removed_rows = item.second.rows.size();
+            }
         }
 
         std::vector<Record> next_records;
-        next_records.reserve(records.size() + module_records.size());
-        std::unordered_map<std::string, ModuleMeta> next_modules;
-
+        next_records.reserve(records.size() + replacements.size());
         for (auto & record : records) {
             if (record.module == module) {
                 continue;
             }
-            auto old_meta = modules.find(record.module);
-            if (old_meta != modules.end()) {
-                auto & meta = next_modules[record.module];
-                meta.version_token = old_meta->second.version_token;
-                meta.imports = old_meta->second.imports;
-                meta.rows.push_back(next_records.size());
-            }
+            next_modules[record.module].rows.push_back(next_records.size());
             next_records.push_back(std::move(record));
         }
 
-        ModuleMeta meta;
-        meta.version_token = token;
-        meta.imports = imports;
-        for (auto & decl : module_records) {
-            meta.rows.push_back(next_records.size());
-            next_records.push_back(std::move(decl));
+        ModuleMeta replacement_meta{token, imports, {}};
+        for (auto & replacement : replacements) {
+            replacement_meta.rows.push_back(next_records.size());
+            next_records.push_back(std::move(replacement));
         }
-        next_modules[module] = std::move(meta);
+        next_modules[module] = std::move(replacement_meta);
 
         dim = next_dim;
         records = std::move(next_records);
         modules = std::move(next_modules);
-        rebuild_vectors_locked();
-        rebuild_vector_index_locked();
+        n_premises = (int) records.size();
+        rebuild_faiss_index_locked();
+
+        if (!index_path.empty()) {
+            dirty = true;
+            unsaved_rows += removed_rows + declarations.size();
+        }
     }
 
-    // Brute-force cosine similarity (inner product on L2-normalised vectors).
-    // Returns top_k hits sorted by descending score.
-    std::vector<Hit>
-    search(const float * query, int top_k) const {
-        std::lock_guard<std::mutex> lk(mu);
-        int k = std::min(top_k, n_premises);
-        if (k <= 0) {
+    std::vector<Hit> search_all(const float * query, int top_k) const {
+        std::lock_guard<std::mutex> lock(mu);
+        const int count = std::min(top_k, n_premises);
+        if (count <= 0 || !faiss_index) {
             return {};
         }
-#ifdef LLAMA_PREMISE_USE_FAISS
-        if (faiss_index) {
-            std::vector<float> scores(k);
-            std::vector<faiss::idx_t> labels(k);
-            faiss_index->search(1, query, k, scores.data(), labels.data());
 
-            std::vector<Hit> out;
-            out.reserve(k);
-            for (int i = 0; i < k; ++i) {
-                if (labels[i] >= 0 && labels[i] < (faiss::idx_t) records.size()) {
-                    out.push_back(make_hit_locked((size_t) labels[i], scores[i]));
-                }
+        std::vector<float> scores((size_t) count);
+        std::vector<faiss::idx_t> labels((size_t) count);
+        faiss_index->search(1, query, count, scores.data(), labels.data());
+
+        std::vector<Hit> hits;
+        hits.reserve((size_t) count);
+        for (int i = 0; i < count; ++i) {
+            if (labels[(size_t) i] >= 0 && labels[(size_t) i] < (faiss::idx_t) records.size()) {
+                hits.push_back(make_hit_locked((size_t) labels[(size_t) i], scores[(size_t) i]));
             }
-            return out;
         }
-#endif
-        std::vector<std::pair<float, int>> scores(n_premises);
-        for (int i = 0; i < n_premises; ++i) {
-            float dot = 0.0f;
-            const float * row = vectors.data() + (size_t)i * dim;
-            for (int d = 0; d < dim; ++d) dot += query[d] * row[d];
-            scores[i] = {dot, i};
-        }
-        std::partial_sort(scores.begin(), scores.begin() + k, scores.end(),
-                          [](const auto & a, const auto & b){ return a.first > b.first; });
-        std::vector<Hit> out;
-        out.reserve(k);
-        for (int i = 0; i < k; ++i)
-            out.push_back(make_hit_locked((size_t) scores[i].second, scores[i].first));
-        return out;
+        return hits;
     }
 
-    std::vector<Hit> search(const float * query,
-                            const std::vector<std::string> & imports,
-                            const std::vector<Record> & local,
-                            int top_k) const {
+    // Restricts candidates to imported modules and request-local declarations.
+    // This remains an explicit score pass because the candidate set is dynamic.
+    std::vector<Hit> search_imports(const float * query,
+                                    const std::vector<std::string> & imports,
+                                    const std::vector<Record> & local,
+                                    int top_k) const {
         struct ScoredHit {
             float score;
             Hit hit;
         };
 
-        std::lock_guard<std::mutex> lk(mu);
+        std::lock_guard<std::mutex> lock(mu);
         std::vector<size_t> rows;
         std::unordered_set<std::string> visited_modules;
         std::unordered_set<std::string> seen_names;
@@ -244,8 +284,8 @@ struct PremiseIndex {
         std::vector<ScoredHit> scored;
         scored.reserve(rows.size() + local.size());
         for (size_t row : rows) {
-            scored.push_back({score_row_locked(query, row), make_hit_locked(row, 0.0f)});
-            scored.back().hit.score = scored.back().score;
+            const float score = score_embedding(query, records[row].embedding);
+            scored.push_back({score, make_hit_locked(row, score)});
         }
         for (const auto & record : local) {
             if (!record.name.empty() && !seen_names.insert(record.name).second) {
@@ -254,57 +294,149 @@ struct PremiseIndex {
             if ((int) record.embedding.size() != dim) {
                 continue;
             }
-            float score = 0.0f;
-            for (int i = 0; i < dim; ++i) {
-                score += query[i] * record.embedding[(size_t) i];
-            }
+            const float score = score_embedding(query, record.embedding);
             scored.push_back({score, {record.name, record.decl, record.decl, record.module, score}});
         }
 
-        int k = std::min(top_k, (int) scored.size());
-        if (k <= 0) {
+        const int count = std::min(top_k, (int) scored.size());
+        if (count <= 0) {
             return {};
         }
-        std::partial_sort(scored.begin(), scored.begin() + k, scored.end(),
-                [](const ScoredHit & a, const ScoredHit & b) { return a.score > b.score; });
+        std::partial_sort(scored.begin(), scored.begin() + count, scored.end(),
+                [](const ScoredHit & left, const ScoredHit & right) { return left.score > right.score; });
 
-        std::vector<Hit> out;
-        out.reserve(k);
-        for (int i = 0; i < k; ++i) {
-            out.push_back(std::move(scored[(size_t) i].hit));
+        std::vector<Hit> hits;
+        hits.reserve((size_t) count);
+        for (int i = 0; i < count; ++i) {
+            hits.push_back(std::move(scored[(size_t) i].hit));
         }
-        return out;
+        return hits;
+    }
+
+    // Persists the complete cache when requested after enough changes or time,
+    // and unconditionally during shutdown.
+    void flush(bool force) {
+        std::lock_guard<std::mutex> lock(mu);
+        if (!dirty || index_path.empty() || metadata_path.empty()) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (!force && unsaved_rows < SAVE_EVERY && now - last_save < std::chrono::seconds(SAVE_SECONDS)) {
+            return;
+        }
+
+        const std::string index_tmp = index_path + ".tmp";
+        const std::string metadata_tmp = metadata_path + ".tmp";
+        try {
+            faiss::IndexFlatIP saved_index(dim);
+            std::ofstream metadata(metadata_tmp, std::ios::binary | std::ios::trunc);
+            if (!metadata) {
+                throw std::runtime_error("cannot open metadata temporary file");
+            }
+
+            metadata.write(META_MAGIC, sizeof(META_MAGIC));
+            write_u32(metadata, (uint32_t) modules.size());
+            for (const auto & item : modules) {
+                write_string(metadata, item.first);
+                write_string(metadata, item.second.version_token);
+                write_u32(metadata, (uint32_t) item.second.imports.size());
+                for (const auto & imported : item.second.imports) {
+                    write_string(metadata, imported);
+                }
+
+                uint32_t valid_rows = 0;
+                for (size_t row : item.second.rows) {
+                    valid_rows += row < records.size();
+                }
+                write_u32(metadata, valid_rows);
+                for (size_t row : item.second.rows) {
+                    if (row < records.size()) {
+                        write_string(metadata, records[row].name);
+                        saved_index.add(1, records[row].embedding.data());
+                    }
+                }
+            }
+            metadata.close();
+            if (!metadata) {
+                throw std::runtime_error("cannot write metadata temporary file");
+            }
+            faiss::write_index(&saved_index, index_tmp.c_str());
+        } catch (const std::exception & error) {
+            std::remove(index_tmp.c_str());
+            std::remove(metadata_tmp.c_str());
+            fprintf(stderr, "premise cache: save failed (%s)\n", error.what());
+            return;
+        }
+
+        std::remove(index_path.c_str()); // Windows rename does not overwrite
+        std::remove(metadata_path.c_str());
+        if (std::rename(index_tmp.c_str(), index_path.c_str()) != 0 ||
+                std::rename(metadata_tmp.c_str(), metadata_path.c_str()) != 0) {
+            fprintf(stderr, "premise cache: failed to install saved files\n");
+            return;
+        }
+
+        fprintf(stderr, "premise cache: saved %d embeddings\n", n_premises);
+        dirty = false;
+        unsaved_rows = 0;
+        last_save = now;
     }
 
 private:
-    void rebuild_vectors_locked() {
-        n_premises = (int) records.size();
-        vectors.clear();
-        strings.clear();
-        vectors.reserve((size_t) n_premises * dim);
-        strings.reserve(records.size());
-        for (const auto & record : records) {
-            strings.push_back(record.decl);
-            vectors.insert(vectors.end(), record.embedding.begin(), record.embedding.end());
+    static constexpr size_t SAVE_EVERY = 1024;
+    static constexpr int SAVE_SECONDS = 60;
+    inline static constexpr char META_MAGIC[8] = {'P', 'M', 'N', 'A', 'M', 'E', '0', '1'};
+
+    std::vector<Record> records;
+    std::unordered_map<std::string, ModuleMeta> modules;
+    std::unique_ptr<faiss::IndexFlat> faiss_index;
+    std::string index_path;
+    std::string metadata_path;
+    bool dirty = false;
+    size_t unsaved_rows = 0;
+    std::chrono::steady_clock::time_point last_save = std::chrono::steady_clock::now();
+    mutable std::mutex mu;
+
+    static std::unique_ptr<faiss::IndexFlat> read_faiss_index(const char * path) {
+        std::unique_ptr<faiss::Index> index(faiss::read_index(path));
+        auto * flat = dynamic_cast<faiss::IndexFlat *>(index.get());
+        if (!flat || flat->metric_type != faiss::METRIC_INNER_PRODUCT) {
+            throw std::runtime_error(std::string("expected FAISS IndexFlatIP in ") + path);
         }
+        index.release();
+        return std::unique_ptr<faiss::IndexFlat>(flat);
     }
 
-    void rebuild_vector_index_locked() {
-#ifdef LLAMA_PREMISE_USE_FAISS
+    void reset_locked(int model_dim) {
+        n_premises = 0;
+        dim = model_dim;
+        records.clear();
+        modules.clear();
+        rebuild_faiss_index_locked();
+        dirty = false;
+        unsaved_rows = 0;
+        last_save = std::chrono::steady_clock::now();
+    }
+
+    void rebuild_faiss_index_locked() {
         faiss_index = dim > 0 ? std::make_unique<faiss::IndexFlatIP>(dim) : nullptr;
-        if (faiss_index && n_premises > 0) {
-            faiss_index->add(n_premises, vectors.data());
+        if (!faiss_index) {
+            return;
         }
-#endif
+        for (const auto & record : records) {
+            if ((int) record.embedding.size() != dim) {
+                throw std::runtime_error("premise embedding dimension mismatch");
+            }
+            faiss_index->add(1, record.embedding.data());
+        }
     }
 
-    float score_row_locked(const float * query, size_t row) const {
-        float dot = 0.0f;
-        const float * vec = vectors.data() + row * (size_t) dim;
+    float score_embedding(const float * query, const std::vector<float> & embedding) const {
+        float score = 0.0f;
         for (int i = 0; i < dim; ++i) {
-            dot += query[i] * vec[i];
+            score += query[i] * embedding[(size_t) i];
         }
-        return dot;
+        return score;
     }
 
     Hit make_hit_locked(size_t row, float score) const {
@@ -315,7 +447,7 @@ private:
     void collect_module_rows_locked(const std::string & module,
                                     std::unordered_set<std::string> & visited_modules,
                                     std::unordered_set<std::string> & seen_names,
-                                    std::vector<size_t> & out) const {
+                                    std::vector<size_t> & rows) const {
         if (!visited_modules.insert(module).second) {
             return;
         }
@@ -324,349 +456,86 @@ private:
             return;
         }
         for (const auto & imported : it->second.imports) {
-            collect_module_rows_locked(imported, visited_modules, seen_names, out);
+            collect_module_rows_locked(imported, visited_modules, seen_names, rows);
         }
         for (size_t row : it->second.rows) {
             if (row < records.size() && (records[row].name.empty() || seen_names.insert(records[row].name).second)) {
-                out.push_back(row);
+                rows.push_back(row);
             }
         }
     }
-};
 
-// Persistent embedding cache used by standalone premise-server
-// (PremiseMode::Embedding). Lean owns elaboration and module freshness: it sends
-// /version requests, and if a module token is stale it sends /cache with module,
-// imports, fully-qualified declaration names, and declaration strings. The server
-// embeds those strings but does not persist them.
-//
-// On disk this is two aligned tables:
-//   - premise_vectors.bin: int32 n_rows, int32 dim, then n_rows * dim floats
-//   - premise_names.bin: binary metadata grouped by defining module
-//
-// premise_names.bin format (little-endian):
-//   magic "PMNAME01"
-//   u32 n_modules
-//   repeated module blocks:
-//     str module_name
-//     str version_token
-//     u32 n_imports, repeated str import_name
-//     u32 n_decls, repeated str declaration_name
-//
-// String encoding is u32 byte length followed by UTF-8 bytes. Declaration names
-// are stored under the module that defines them. The declaration traversal order
-// in premise_names.bin is exactly the vector row order in premise_vectors.bin.
-struct PremiseEmbedCache {
-    static constexpr size_t SAVE_EVERY   = 1024; // unsaved rows that force a save
-    static constexpr int    SAVE_SECONDS = 60;   // dirty-cache flush interval
-    inline static constexpr char META_MAGIC[8] = {'P', 'M', 'N', 'A', 'M', 'E', '0', '1'};
-
-    struct Entry {
-        std::string module;
-        std::string name;
-        std::vector<float> embedding;
-    };
-
-    struct ModuleMeta {
-        std::string version_token;
-        std::vector<std::string> imports;
-        std::vector<size_t> rows;
-    };
-
-    struct ModuleSnapshot {
-        std::string module;
-        std::string version_token;
-        std::vector<std::string> imports;
-        std::vector<std::pair<std::string, std::vector<float>>> declarations;
-    };
-
-    std::string vec_path;
-    std::string meta_path;
-    int dim = 0;
-
-    std::mutex mu;
-    std::vector<Entry>                       entries; // insertion order == vector row order
-    std::unordered_map<std::string, size_t>  index;   // module + name -> row
-    std::unordered_map<std::string, ModuleMeta> modules;
-    size_t n_dirty = 0;
-    bool metadata_dirty = false;
-    std::chrono::steady_clock::time_point last_save = std::chrono::steady_clock::now();
-
-    static std::string key(const std::string & module, const std::string & name) {
-        return module + "\n" + name;
+    static bool read_u32(std::istream & input, uint32_t & value) {
+        input.read(reinterpret_cast<char *>(&value), sizeof(value));
+        return !!input;
     }
 
-    static bool read_u32(std::istream & in, uint32_t & out) {
-        in.read(reinterpret_cast<char *>(&out), sizeof(out));
-        return !!in;
-    }
-
-    static bool read_string(std::istream & in, std::string & out) {
-        uint32_t n = 0;
-        if (!read_u32(in, n)) {
+    static bool read_string(std::istream & input, std::string & value) {
+        uint32_t size = 0;
+        if (!read_u32(input, size)) {
             return false;
         }
-        out.resize(n);
-        if (n > 0) {
-            in.read(out.data(), n);
+        value.resize(size);
+        if (size > 0) {
+            input.read(value.data(), size);
         }
-        return !!in;
+        return !!input;
     }
 
-    static void write_u32(std::ostream & out, uint32_t value) {
-        out.write(reinterpret_cast<const char *>(&value), sizeof(value));
-    }
-
-    static void write_string(std::ostream & out, const std::string & value) {
-        write_u32(out, (uint32_t) value.size());
-        out.write(value.data(), (std::streamsize) value.size());
-    }
-
-    void load(const std::string & vec, const std::string & meta, int model_dim) {
-        vec_path = vec;
-        meta_path = meta;
-        dim      = model_dim;
-        std::ifstream fs(meta_path, std::ios::binary);
-        std::ifstream fv(vec_path, std::ios::binary);
-        if (!fs || !fv) {
-            fprintf(stderr, "premise cache: starting empty (index files not present yet)\n");
-            return;
-        }
-        std::vector<std::pair<std::string, std::string>> loaded;
+    static void read_metadata(std::istream & input,
+                              std::unordered_map<std::string, ModuleMeta> & loaded_modules,
+                              std::vector<std::pair<std::string, std::string>> & loaded_names) {
         char magic[sizeof(META_MAGIC)] = {};
-        fs.read(magic, sizeof(magic));
-        if (!fs || std::memcmp(magic, META_MAGIC, sizeof(META_MAGIC)) != 0) {
-            fprintf(stderr, "premise cache: ignoring unsupported metadata file %s\n", meta_path.c_str());
-            return;
+        input.read(magic, sizeof(magic));
+        if (!input || std::memcmp(magic, META_MAGIC, sizeof(META_MAGIC)) != 0) {
+            throw std::runtime_error("unsupported premise metadata format");
         }
 
-        uint32_t n_modules = 0;
-        if (!read_u32(fs, n_modules)) {
-            fprintf(stderr, "premise cache: ignoring truncated metadata file %s\n", meta_path.c_str());
-            return;
+        uint32_t module_count = 0;
+        if (!read_u32(input, module_count)) {
+            throw std::runtime_error("truncated premise metadata");
         }
-        for (uint32_t i = 0; i < n_modules; ++i) {
+        for (uint32_t i = 0; i < module_count; ++i) {
             std::string module;
-            ModuleMeta meta;
-            if (!read_string(fs, module) || !read_string(fs, meta.version_token)) {
-                fprintf(stderr, "premise cache: ignoring truncated metadata file %s\n", meta_path.c_str());
-                return;
+            ModuleMeta metadata;
+            if (!read_string(input, module) || !read_string(input, metadata.version_token)) {
+                throw std::runtime_error("truncated premise metadata");
             }
-            uint32_t n_imports = 0;
-            if (!read_u32(fs, n_imports)) {
-                fprintf(stderr, "premise cache: ignoring truncated metadata file %s\n", meta_path.c_str());
-                return;
+
+            uint32_t import_count = 0;
+            if (!read_u32(input, import_count)) {
+                throw std::runtime_error("truncated premise metadata");
             }
-            meta.imports.reserve(n_imports);
-            for (uint32_t j = 0; j < n_imports; ++j) {
+            metadata.imports.reserve(import_count);
+            for (uint32_t j = 0; j < import_count; ++j) {
                 std::string imported;
-                if (!read_string(fs, imported)) {
-                    fprintf(stderr, "premise cache: ignoring truncated metadata file %s\n", meta_path.c_str());
-                    return;
+                if (!read_string(input, imported)) {
+                    throw std::runtime_error("truncated premise metadata");
                 }
-                meta.imports.push_back(std::move(imported));
+                metadata.imports.push_back(std::move(imported));
             }
-            uint32_t n_decls = 0;
-            if (!read_u32(fs, n_decls)) {
-                fprintf(stderr, "premise cache: ignoring truncated metadata file %s\n", meta_path.c_str());
-                return;
+
+            uint32_t declaration_count = 0;
+            if (!read_u32(input, declaration_count)) {
+                throw std::runtime_error("truncated premise metadata");
             }
-            modules.emplace(module, std::move(meta));
-            for (uint32_t j = 0; j < n_decls; ++j) {
+            loaded_modules[module] = std::move(metadata);
+            for (uint32_t j = 0; j < declaration_count; ++j) {
                 std::string name;
-                if (!read_string(fs, name)) {
-                    fprintf(stderr, "premise cache: ignoring truncated metadata file %s\n", meta_path.c_str());
-                    return;
+                if (!read_string(input, name)) {
+                    throw std::runtime_error("truncated premise metadata");
                 }
-                loaded.push_back({module, std::move(name)});
+                loaded_names.push_back({module, std::move(name)});
             }
-        }
-        int32_t n = 0, d = 0;
-        fv.read(reinterpret_cast<char *>(&n), sizeof(n));
-        fv.read(reinterpret_cast<char *>(&d), sizeof(d));
-        if (!fv || d != model_dim) {
-            fprintf(stderr, "premise cache: ignoring %s (dim %d != model dim %d)\n",
-                    vec_path.c_str(), d, model_dim);
-            return;
-        }
-        size_t count = std::min(loaded.size(), (size_t) std::max<int32_t>(0, n));
-        for (size_t i = 0; i < count; ++i) {
-            std::vector<float> row(dim);
-            fv.read(reinterpret_cast<char *>(row.data()), (size_t) dim * sizeof(float));
-            if (!fv) { count = i; break; }
-            const auto & module = loaded[i].first;
-            const auto & name = loaded[i].second;
-            if (index.emplace(key(module, name), entries.size()).second) {
-                modules[module].rows.push_back(entries.size());
-                entries.push_back({module, name, std::move(row)});
-            }
-        }
-        if (entries.size() != loaded.size() || (int32_t) count != n) {
-            n_dirty = entries.size();
-            metadata_dirty = true;
-        }
-        fprintf(stderr, "premise cache: loaded %zu embeddings from %s\n", entries.size(), vec_path.c_str());
-    }
-
-    size_t size() {
-        std::lock_guard<std::mutex> lk(mu);
-        return entries.size();
-    }
-
-    std::vector<ModuleSnapshot> snapshot_modules() {
-        std::lock_guard<std::mutex> lk(mu);
-        std::vector<ModuleSnapshot> out;
-        out.reserve(modules.size());
-        for (const auto & item : modules) {
-            ModuleSnapshot snap;
-            snap.module = item.first;
-            snap.version_token = item.second.version_token;
-            snap.imports = item.second.imports;
-            snap.declarations.reserve(item.second.rows.size());
-            for (size_t row : item.second.rows) {
-                if (row < entries.size()) {
-                    snap.declarations.push_back({entries[row].name, entries[row].embedding});
-                }
-            }
-            out.push_back(std::move(snap));
-        }
-        return out;
-    }
-
-    bool find(const std::string & module, const std::string & name, std::vector<float> & out) {
-        std::lock_guard<std::mutex> lk(mu);
-        auto it = index.find(key(module, name));
-        if (it == index.end()) {
-            return false;
-        }
-        out = entries[it->second].embedding;
-        return true;
-    }
-
-    void replace_module(const std::string & module,
-                        const std::string & token,
-                        const std::vector<std::string> & imports,
-                        const std::vector<std::string> & names,
-                        const std::vector<std::vector<float>> & embeddings) {
-        std::lock_guard<std::mutex> lk(mu);
-        std::vector<Entry> next;
-        next.reserve(entries.size() + names.size());
-        std::unordered_map<std::string, size_t> next_index;
-        std::unordered_map<std::string, ModuleMeta> next_modules;
-        for (auto & entry : entries) {
-            if (entry.module == module) {
-                continue;
-            }
-            auto & meta = next_modules[entry.module];
-            auto old_meta = modules.find(entry.module);
-            if (old_meta != modules.end()) {
-                meta.version_token = old_meta->second.version_token;
-                meta.imports = old_meta->second.imports;
-            }
-            meta.rows.push_back(next.size());
-            next_index.emplace(key(entry.module, entry.name), next.size());
-            next.push_back(std::move(entry));
-        }
-        ModuleMeta meta;
-        meta.version_token = token;
-        meta.imports = imports;
-        for (size_t i = 0; i < names.size(); ++i) {
-            const std::string k = key(module, names[i]);
-            if (next_index.emplace(k, next.size()).second) {
-                meta.rows.push_back(next.size());
-                next.push_back({module, names[i], embeddings[i]});
-            }
-        }
-        next_modules[module] = std::move(meta);
-        entries = std::move(next);
-        index = std::move(next_index);
-        modules = std::move(next_modules);
-        metadata_dirty = true;
-        n_dirty += names.size();
-        if (n_dirty > entries.size()) {
-            n_dirty = entries.size();
         }
     }
 
-    void maybe_save(bool force) {
-        std::lock_guard<std::mutex> lk(mu);
-        if ((n_dirty == 0 && !metadata_dirty) || vec_path.empty() || meta_path.empty()) {
-            return;
-        }
-        const auto now = std::chrono::steady_clock::now();
-        if (!force && n_dirty < SAVE_EVERY && now - last_save < std::chrono::seconds(SAVE_SECONDS)) {
-            return;
-        }
+    static void write_u32(std::ostream & output, uint32_t value) {
+        output.write(reinterpret_cast<const char *>(&value), sizeof(value));
+    }
 
-        std::vector<size_t> save_rows;
-        save_rows.reserve(entries.size());
-        for (const auto & item : modules) {
-            for (size_t row : item.second.rows) {
-                if (row < entries.size()) {
-                    save_rows.push_back(row);
-                }
-            }
-        }
-
-        const bool write_vectors = n_dirty > 0;
-        const std::string vec_tmp = vec_path + ".tmp";
-        if (write_vectors) {
-            FILE * f = fopen(vec_tmp.c_str(), "wb");
-            if (!f) {
-                fprintf(stderr, "premise cache: cannot write %s\n", vec_tmp.c_str());
-                return;
-            }
-            int32_t header[2] = { (int32_t) save_rows.size(), (int32_t) dim };
-            fwrite(header, sizeof(header), 1, f);
-            for (size_t row : save_rows) {
-                fwrite(entries[row].embedding.data(), sizeof(float), (size_t) dim, f);
-            }
-            fclose(f);
-        }
-
-        const std::string meta_tmp = meta_path + ".tmp";
-        std::ofstream fs(meta_tmp, std::ios::binary | std::ios::trunc);
-        fs.write(META_MAGIC, sizeof(META_MAGIC));
-        write_u32(fs, (uint32_t) modules.size());
-        for (const auto & item : modules) {
-            write_string(fs, item.first);
-            write_string(fs, item.second.version_token);
-            write_u32(fs, (uint32_t) item.second.imports.size());
-            for (const auto & imported : item.second.imports) {
-                write_string(fs, imported);
-            }
-            uint32_t n_rows = 0;
-            for (size_t row : item.second.rows) {
-                if (row < entries.size()) {
-                    ++n_rows;
-                }
-            }
-            write_u32(fs, n_rows);
-            for (size_t row : item.second.rows) {
-                if (row < entries.size()) {
-                    write_string(fs, entries[row].name);
-                }
-            }
-        }
-        fs.close();
-        if (!fs) {
-            fprintf(stderr, "premise cache: cannot write %s\n", meta_tmp.c_str());
-            if (write_vectors) {
-                std::remove(vec_tmp.c_str());
-            }
-            return;
-        }
-
-        if (write_vectors) {
-            std::remove(vec_path.c_str()); // Windows rename does not overwrite
-            std::rename(vec_tmp.c_str(), vec_path.c_str());
-        }
-        std::remove(meta_path.c_str());
-        std::rename(meta_tmp.c_str(), meta_path.c_str());
-
-        fprintf(stderr, "premise cache: saved %zu embeddings\n", entries.size());
-        n_dirty = 0;
-        metadata_dirty = false;
-        last_save = now;
+    static void write_string(std::ostream & output, const std::string & value) {
+        write_u32(output, (uint32_t) value.size());
+        output.write(value.data(), (std::streamsize) value.size());
     }
 };

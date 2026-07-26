@@ -29,7 +29,6 @@ struct PremiseRetrievalState {
     std::vector<llama_context *>  emb_ctxs;
     std::vector<llama_context *>  idle_emb_ctxs;
     std::unique_ptr<PremiseIndex> premise_index;
-    std::unique_ptr<PremiseEmbedCache> embed_cache;
     llama_token                   emb_token_id = -1;
     int                           embedding_dim = 0;
     bool                          joint_generation = false;

@@ -12,16 +12,16 @@
 #include <vector>
 
 void premise_setup(server_context & ctx_server,
-                   const std::string & premise_vec_path,
-                   const std::string & premise_str_path,
+                   const std::string & premise_index_path,
+                   const std::string & premise_metadata_path,
                    PremiseMode premise_mode,
                    int embedding_workers) {
-    const bool has_index_paths = !premise_vec_path.empty() && !premise_str_path.empty();
+    const bool has_index_paths = !premise_index_path.empty() && !premise_metadata_path.empty();
     if (!has_index_paths && premise_mode == PremiseMode::Auto) {
         return;
     }
 
-    if (premise_vec_path.empty() != premise_str_path.empty()) {
+    if (premise_index_path.empty() != premise_metadata_path.empty()) {
         SRV_WRN("%s", "joint retrieval: --index-vecs and --index-names must be provided together; offline index disabled\n");
     }
 
@@ -69,25 +69,20 @@ void premise_setup(server_context & ctx_server,
         }
 
         const int embedding_dim = llama_model_n_embd_out(model);
-        std::unique_ptr<PremiseEmbedCache> embed_cache;
         std::unique_ptr<PremiseIndex> premise_index;
 
         if (premise_mode == PremiseMode::Embedding) {
             premise_index = std::make_unique<PremiseIndex>();
-            premise_index->init_empty(embedding_dim);
-        }
-
-        if (has_index_paths && premise_mode == PremiseMode::Embedding) {
-            // cache/select mode: the index paths name a persistent embedding
-            // cache that this server creates and updates itself, so missing
-            // files just mean a cold cache.
-            embed_cache = std::make_unique<PremiseEmbedCache>();
-            embed_cache->load(premise_vec_path, premise_str_path, embedding_dim);
+            if (has_index_paths) {
+                premise_index->load_cache(premise_index_path, premise_metadata_path, embedding_dim);
+            } else {
+                premise_index->initialize_empty(embedding_dim);
+            }
         } else if (has_index_paths) {
             premise_index = std::make_unique<PremiseIndex>();
-            premise_index->load(
-                premise_vec_path.c_str(),
-                premise_str_path.c_str(),
+            premise_index->load_offline(
+                premise_index_path.c_str(),
+                premise_metadata_path.c_str(),
                 0 /* load all */);
             const int n_embd_out = embedding_dim;
             if (premise_index->dim != n_embd_out) {
@@ -103,23 +98,7 @@ void premise_setup(server_context & ctx_server,
         js->emb_token_id = emb_token_id;
         js->joint_generation = premise_mode != PremiseMode::Embedding && emb_token_id >= 0;
         js->embedding_dim = embedding_dim;
-        js->embed_cache = std::move(embed_cache);
         js->premise_index = std::move(premise_index);
-
-        if (js->embed_cache && js->premise_index) {
-            for (const auto & snap : js->embed_cache->snapshot_modules()) {
-                std::vector<PremiseIndex::Record> declarations;
-                declarations.reserve(snap.declarations.size());
-                for (const auto & decl : snap.declarations) {
-                    PremiseIndex::Record record;
-                    record.name = decl.first;
-                    record.module = snap.module;
-                    record.embedding = decl.second;
-                    declarations.push_back(std::move(record));
-                }
-                js->premise_index->replace_module(snap.module, snap.version_token, snap.imports, declarations);
-            }
-        }
 
         g_premise_state = js.release();
         const int n_premises = g_premise_state->premise_index ? g_premise_state->premise_index->n_premises : 0;
@@ -140,8 +119,8 @@ void premise_setup(server_context & ctx_server,
 
 void premise_cleanup() {
     if (g_premise_state) {
-        if (g_premise_state->embed_cache) {
-            g_premise_state->embed_cache->maybe_save(true);
+        if (g_premise_state->premise_index) {
+            g_premise_state->premise_index->flush(true);
         }
         for (llama_context * emb_ctx : g_premise_state->emb_ctxs) {
             llama_free(emb_ctx);

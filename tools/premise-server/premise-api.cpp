@@ -77,14 +77,15 @@ static json search_request_json(const PremiseRetrievalRequest & request, const s
         return json::array();
     }
     auto local = premise_embed_declarations(request.declarations, "");
-    return hits_json(g_premise_state->premise_index->search(query.data(), request.imports, local, request.top_k));
+    return hits_json(g_premise_state->premise_index->search_imports(
+            query.data(), request.imports, local, request.top_k));
 }
 
 static json search_global_json(const std::vector<float> & query, int top_k) {
     if (!g_premise_state->premise_index) {
         return json::array();
     }
-    return hits_json(g_premise_state->premise_index->search(query.data(), top_k));
+    return hits_json(g_premise_state->premise_index->search_all(query.data(), top_k));
 }
 
 static bool cache_module_if_stale(const std::string & module,
@@ -94,22 +95,11 @@ static bool cache_module_if_stale(const std::string & module,
     if (!g_premise_state->premise_index) {
         throw std::runtime_error("premise index is not initialized");
     }
-    if (g_premise_state->premise_index->module_version(module) == token) {
+    if (g_premise_state->premise_index->get_module_version(module) == token) {
         return false;
     }
 
     auto declarations = premise_embed_declarations(parsed_declarations, module);
-    if (g_premise_state->embed_cache) {
-        std::vector<std::string> names;
-        std::vector<std::vector<float>> embeddings;
-        names.reserve(declarations.size());
-        embeddings.reserve(declarations.size());
-        for (const auto & decl : declarations) {
-            names.push_back(decl.name);
-            embeddings.push_back(decl.embedding);
-        }
-        g_premise_state->embed_cache->replace_module(module, token, imports, names, embeddings);
-    }
     g_premise_state->premise_index->replace_module(module, token, imports, declarations);
     return true;
 }
@@ -209,7 +199,7 @@ json premise_api_version(const json & data) {
     if (!g_premise_state || !g_premise_state->premise_index || module.empty()) {
         return nullptr;
     }
-    const std::string token = g_premise_state->premise_index->module_version(module);
+    const std::string token = g_premise_state->premise_index->get_module_version(module);
     return token.empty() ? json(nullptr) : json(token);
 }
 
@@ -228,7 +218,7 @@ json premise_api_version_batch(const json & data) {
             modules.push_back(item.get<std::string>());
         }
     }
-    const auto versions = g_premise_state->premise_index->module_versions(modules);
+    const auto versions = g_premise_state->premise_index->get_module_versions(modules);
     for (const auto & module : modules) {
         auto version = versions.find(module);
         result[module] = version == versions.end() ? json(nullptr) : json(version->second);
@@ -253,8 +243,8 @@ json premise_api_cache(const json & data) {
 
     const std::vector<std::string> imports = parse_string_array(data, "imports");
     const bool changed = cache_module_if_stale(module, token, imports, parse_declarations(data));
-    if (changed && g_premise_state->embed_cache) {
-        g_premise_state->embed_cache->maybe_save(false);
+    if (changed) {
+        g_premise_state->premise_index->flush(false);
     }
     return json{{"ok", true}};
 }
@@ -287,8 +277,8 @@ json premise_api_cache_batch(const json & data) {
         }
     }
 
-    if (count > 0 && g_premise_state->embed_cache) {
-        g_premise_state->embed_cache->maybe_save(false);
+    if (count > 0) {
+        g_premise_state->premise_index->flush(false);
     }
     return json{{"ok", true}, {"count", count}};
 }
