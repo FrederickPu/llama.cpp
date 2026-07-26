@@ -17,6 +17,12 @@ set(FAISS_ENABLE_MKL    OFF CACHE BOOL "" FORCE)
 set(FAISS_USE_LTO       OFF CACHE BOOL "" FORCE)
 set(FAISS_OPT_LEVEL "generic" CACHE STRING "" FORCE)
 
+set(_llama_faiss_module_path "${CMAKE_MODULE_PATH}")
+if (NOT GGML_OPENMP_ENABLED)
+    list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+    message(STATUS "premise-server: building FAISS without OpenMP")
+endif()
+
 add_library(llama-faiss-blas STATIC blas-shim.cpp)
 target_compile_features(llama-faiss-blas PRIVATE cxx_std_17)
 install(TARGETS llama-faiss-blas EXPORT faiss-targets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
@@ -54,6 +60,7 @@ FetchContent_Declare(faiss
     DOWNLOAD_EXTRACT_TIMESTAMP NEW
 )
 FetchContent_MakeAvailable(faiss)
+set(CMAKE_MODULE_PATH "${_llama_faiss_module_path}")
 
 if (_llama_faiss_restore_blas)
     set(BLAS_LIBRARIES "${_llama_faiss_blas_libraries}" CACHE STRING "" FORCE)
