@@ -62,6 +62,12 @@ FetchContent_Declare(faiss
 FetchContent_MakeAvailable(faiss)
 set(CMAKE_MODULE_PATH "${_llama_faiss_module_path}")
 
+if (WIN32 AND CMAKE_SYSTEM_PROCESSOR MATCHES "(aarch64|arm64|ARM64)" AND CMAKE_CXX_SIMULATE_ID STREQUAL "MSVC")
+    get_target_property(_llama_faiss_compile_definitions faiss COMPILE_DEFINITIONS)
+    list(REMOVE_ITEM _llama_faiss_compile_definitions COMPILE_SIMD_ARM_NEON)
+    set_property(TARGET faiss PROPERTY COMPILE_DEFINITIONS "${_llama_faiss_compile_definitions}")
+endif()
+
 if (_llama_faiss_restore_blas)
     set(BLAS_LIBRARIES "${_llama_faiss_blas_libraries}" CACHE STRING "" FORCE)
 else()
