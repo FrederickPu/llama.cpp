@@ -4,10 +4,7 @@ set(_SERVER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../server")
 set(_ROOT_DIR  "${CMAKE_CURRENT_SOURCE_DIR}/../..")
 
 add_library(premise-server-lib STATIC
-    ${CMAKE_CURRENT_SOURCE_DIR}/premise-api.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/premise-init.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/premise-retrieval.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/premise-http.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/premise.cpp
 )
 
 target_include_directories(premise-server-lib PUBLIC

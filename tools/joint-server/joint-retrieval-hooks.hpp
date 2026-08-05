@@ -1,6 +1,6 @@
 #pragma once
 
-#include "premise-retrieval.hpp"
+#include "premise.hpp"
 
 static std::string server_context_hook_task_created(int task_id, const json & data, bool stream, int n_cmpl) {
     return premise_task_created(task_id, data, stream, n_cmpl);

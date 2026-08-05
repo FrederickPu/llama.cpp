@@ -6,8 +6,8 @@ rank Lean premises. It does not generate text. The intended flow is:
 
   1. Start premise-server with a GGUF embedding model.
   2. Pass --index-vecs and --index-names so declaration embeddings persist.
-  3. Ask /version whether a Lean module is already cached in this process.
-  4. Send declarations to /cache when the version token is missing or stale.
+  3. Ask /version whether one Lean module is already cached.
+  4. Send that module's declarations to /cache when the version token is missing or stale.
   5. Call /select with imports, local declarations, a goal, and k.
 
 Run with --print-guide to see the equivalent manual commands and JSON bodies.
@@ -301,11 +301,11 @@ Build
 Start
 -----
 
-The --index-vecs file stores a serialized FAISS IndexFlatIP. The --index-names
-file is compact binary metadata grouped by defining module: module token,
-imports, and declaration names. Its declaration order is the FAISS row order.
-Pretty-printed declaration strings are sent by Lean only when embeddings need to
-be recomputed; they are not persisted.
+The cache is a pair of files rewritten together on /cache:
+  --index-vecs  : FAISS IndexFlatIP embeddings
+  --index-names : module graph + declaration names in FAISS row order
+Pretty-printed declaration strings are sent by Lean only to compute embeddings;
+they are not stored in either file.
 
    {premise_server_exe} --host {args.host} --port {args.port} --model {args.model} {line_continue}
        --pooling {args.pooling} --ctx-size {args.ctx_size} --parallel {args.parallel} {line_continue}
@@ -324,7 +324,8 @@ API
 
    Expected before /cache: null
 
-2. Cache or refresh declarations for that module.
+2. Cache or refresh declarations for that one module (declarations are
+   batch-embedded in a single forward pass).
 
    POST http://{args.host}:{args.port}/cache
    Content-Type: application/json
@@ -361,13 +362,13 @@ Notes
 -----
 
   - /version is an in-memory module freshness check; it resets on restart.
-  - --index-vecs/--index-names persist embeddings and module version tokens on
-    disk, but not declaration strings.
+  - --index-vecs stores embeddings; --index-names stores module/name identity.
+    Both are updated together. Declaration strings are not persisted.
   - Lean decides which declarations belong to each module and sends fully
     qualified names through /cache; premise-server does not infer module
     membership itself.
-  - --parallel controls how many embedding contexts premise-server can use.
-  - /select can include unsaved local declarations in the request body.
+  - /version and /cache are one module per request.
+   - /select can include unsaved local declarations in the request body.
   - --url runs the same /version, /cache, and /select demo against an existing
     compatible premise-server and will refresh {DEMO_MODULE} in that process.
 """
@@ -394,7 +395,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ctx-size", type=int, default=512)
     parser.add_argument("--parallel", type=int, default=2, help="Number of embedding contexts used by premise-server")
     parser.add_argument("--index-vecs", type=Path, default=DEFAULT_INDEX_VECS, help="Persistent embedding vector cache")
-    parser.add_argument("--index-names", dest="index_names", type=Path, default=DEFAULT_INDEX_NAMES, help="Persistent module/declaration-name metadata cache")
+    parser.add_argument("--index-names", dest="index_names", type=Path, default=DEFAULT_INDEX_NAMES, help="Module/name side of the persistent cache pair")
     parser.add_argument("--index-strings", dest="index_names", type=Path, help="Deprecated alias for --index-names")
     parser.add_argument("--startup-timeout", type=int, default=180)
     parser.add_argument("--server-bin", type=Path, help="Path to premise-server executable")

@@ -1,7 +1,6 @@
 // Premise-only server: loads an embedding model and exposes Lean premise APIs.
 
-#include "premise-http.hpp"
-#include "premise-init.hpp"
+#include "premise.hpp"
 
 #include "arg.h"
 #include "common.h"
@@ -25,6 +24,16 @@
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
 
+static void print_usage(int, char **) {
+    printf("\n\n----- premise-server params -----\n\n");
+    printf("  --index-vecs FILE\n");
+    printf("      path to the FAISS premise index\n\n");
+    printf("  --index-names FILE, --index-strings FILE\n");
+    printf("      path to module/name side of the cache (aligned with --index-vecs)\n\n");
+    printf("  --no-joint\n");
+    printf("      accepted for compatibility; premise-server always runs in embedding mode\n");
+}
+
 static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
         fprintf(stderr, "Received second interrupt, terminating immediately.\n");
@@ -42,16 +51,16 @@ static server_http_res_ptr json_response(const std::string & data) {
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
-    std::string premise_index_path;
-    std::string premise_metadata_path;
+    std::string premise_vecs_path;
+    std::string premise_names_path;
     std::vector<char *> filtered_args;
     filtered_args.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--index-vecs" && i + 1 < argc) {
-            premise_index_path = argv[++i];
+            premise_vecs_path = argv[++i];
         } else if ((a == "--index-names" || a == "--index-strings") && i + 1 < argc) {
-            premise_metadata_path = argv[++i];
+            premise_names_path = argv[++i];
         } else if (a == "--no-joint") {
             // Accepted for compatibility with older local commands.
         } else {
@@ -63,14 +72,11 @@ int main(int argc, char ** argv) {
 
     common_params params;
     common_init();
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
+    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER, print_usage)) {
         return 1;
     }
 
-    // LLAMA_EXAMPLE_SERVER defaults n_parallel to -1 (auto); llama-server's
-    // main resolves it before load_model, so we must too or context creation
-    // fails. A single slot suffices: generation is never used here, and the
-    // premise embedding work runs on a dedicated context (premise-init.cpp).
+    // Base server slot is unused for generation; one is enough for model load.
     if (params.n_parallel < 0) {
         params.n_parallel = 1;
         params.kv_unified = true;
@@ -120,7 +126,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    premise_setup(ctx_server, premise_index_path, premise_metadata_path, PremiseMode::Embedding, params.n_parallel);
+    premise_setup(ctx_server, premise_vecs_path, premise_names_path, PremiseMode::Embedding);
     ctx_http.is_ready.store(true);
     SRV_INF("server is listening on %s\n", ctx_http.listening_address.c_str());
 

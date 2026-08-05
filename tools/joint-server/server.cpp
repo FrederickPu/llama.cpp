@@ -19,8 +19,7 @@
 #include "llama.h"
 #include "log.h"
 
-#include "premise-init.hpp" // joint: setup/cleanup for retrieval state
-#include "premise-http.hpp" // joint: premise cache/retrieve routes
+#include "premise.hpp"
 
 #include <atomic>
 #include <clocale>
@@ -316,7 +315,7 @@ int llama_server(int argc, char ** argv) {
         }
 
         // joint: initialize premise index and embedding context
-        premise_setup(ctx_server, premise_index_path, premise_metadata_path, premise_mode, params.n_parallel);
+        premise_setup(ctx_server, premise_index_path, premise_metadata_path, premise_mode);
 
         routes.update_meta(ctx_server);
         ctx_http.is_ready.store(true);
