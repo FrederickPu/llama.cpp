@@ -48,7 +48,7 @@ struct PremiseIndex {
 
     size_t size() const {
         std::lock_guard<std::mutex> lock(mu);
-        return rows.size();
+        return rows.size() - n_tombstones;
     }
 
     int embedding_dim() const {
@@ -98,32 +98,22 @@ struct PremiseIndex {
         if (dim <= 0 && !replacements.empty()) {
             dim = (int) replacements.front().embedding.size();
         }
-
-        // Build next FAISS + row table: keep other modules, then this module's replacements.
-        auto next_faiss = make_faiss(dim);
-        std::vector<Row> next_rows;
-        std::unordered_map<std::string, ModuleEntry> next_modules;
-
-        for (const auto & item : modules) {
-            if (item.first != module) {
-                next_modules[item.first] = {item.second.version_token, item.second.imports, {}};
-            }
+        if (dim > 0 && !faiss) {
+            faiss = make_faiss(dim);
         }
-        next_modules[module] = {version_token, imports, {}};
 
-        std::vector<float> emb((size_t) std::max(dim, 0));
-        for (faiss::idx_t r = 0; r < (faiss::idx_t) rows.size(); ++r) {
-            if (rows[(size_t) r].module == module) {
-                continue;
-            }
-            if (dim > 0 && faiss) {
-                emb.resize((size_t) dim);
-                faiss->reconstruct(r, emb.data());
-                next_faiss->add(1, emb.data());
-            }
-            next_modules[rows[(size_t) r].module].row_ids.push_back((faiss::idx_t) next_rows.size());
-            next_rows.push_back(rows[(size_t) r]);
+        // Common path: new module -> append. Re-cache: tombstone old rows (FAISS
+        // IndexFlat cannot delete in place), then append replacements. Compact
+        // only when tombstones get large, or on save (save skips dead rows).
+        auto existing = modules.find(module);
+        if (existing != modules.end() && !existing->second.row_ids.empty()) {
+            tombstone_module(module);
         }
+
+        ModuleEntry & entry = modules[module];
+        entry.version_token = version_token;
+        entry.imports = imports;
+        entry.row_ids.clear();
 
         std::unordered_set<std::string> seen;
         for (const auto & c : replacements) {
@@ -133,14 +123,17 @@ struct PremiseIndex {
             if ((int) c.embedding.size() != dim) {
                 throw std::runtime_error("embedding dimension mismatch");
             }
-            next_faiss->add(1, c.embedding.data());
-            next_modules[module].row_ids.push_back((faiss::idx_t) next_rows.size());
-            next_rows.push_back({c.name, module});
+            if (faiss) {
+                faiss->add(1, c.embedding.data());
+            }
+            entry.row_ids.push_back((faiss::idx_t) rows.size());
+            rows.push_back({c.name, module});
         }
 
-        rows = std::move(next_rows);
-        modules = std::move(next_modules);
-        faiss = std::move(next_faiss);
+        if (n_tombstones > 0 && n_tombstones * 4 > rows.size()) {
+            compact();
+        }
+
         if (!vecs_path.empty() && !names_path.empty()) {
             dirty = true;
         }
@@ -238,6 +231,7 @@ private:
     std::string vecs_path;
     std::string names_path;
     bool dirty = false;
+    size_t n_tombstones = 0;
     mutable std::mutex mu;
 
     void clear(int model_dim) {
@@ -246,22 +240,84 @@ private:
         modules.clear();
         faiss = make_faiss(model_dim);
         dirty = false;
+        n_tombstones = 0;
+    }
+
+    // Mark module rows dead without touching FAISS (IndexFlat is append-only).
+    // Caller holds mu. O(|rows of module|).
+    void tombstone_module(const std::string & module) {
+        auto it = modules.find(module);
+        if (it == modules.end()) {
+            return;
+        }
+        for (faiss::idx_t r : it->second.row_ids) {
+            if (r >= 0 && r < (faiss::idx_t) rows.size() && !rows[(size_t) r].name.empty()) {
+                rows[(size_t) r].name.clear();
+                rows[(size_t) r].module.clear();
+                ++n_tombstones;
+            }
+        }
+        it->second.row_ids.clear();
+    }
+
+    // Physically drop tombstones and rewrite FAISS labels. Caller holds mu.
+    void compact() {
+        if (n_tombstones == 0) {
+            return;
+        }
+        auto next_faiss = make_faiss(dim);
+        std::vector<Row> next_rows;
+        next_rows.reserve(rows.size() - n_tombstones);
+        std::unordered_map<std::string, ModuleEntry> next_modules;
+
+        for (const auto & item : modules) {
+            next_modules[item.first] = {item.second.version_token, item.second.imports, {}};
+        }
+
+        const float * xb = (faiss && dim > 0) ? faiss->get_xb() : nullptr;
+        std::vector<float> packed;
+        packed.reserve((rows.size() - n_tombstones) * (size_t) std::max(dim, 0));
+
+        for (faiss::idx_t r = 0; r < (faiss::idx_t) rows.size(); ++r) {
+            if (rows[(size_t) r].name.empty()) {
+                continue;
+            }
+            if (xb) {
+                const float * v = xb + (size_t) r * (size_t) dim;
+                packed.insert(packed.end(), v, v + dim);
+            }
+            const std::string & mod = rows[(size_t) r].module;
+            next_modules[mod].row_ids.push_back((faiss::idx_t) next_rows.size());
+            next_rows.push_back(rows[(size_t) r]);
+        }
+        if (!packed.empty()) {
+            next_faiss->add((faiss::idx_t) (packed.size() / (size_t) dim), packed.data());
+        }
+        rows = std::move(next_rows);
+        modules = std::move(next_modules);
+        faiss = std::move(next_faiss);
+        n_tombstones = 0;
     }
 
     // candidate_rows empty => full index; else FAISS top-k restricted to those labels.
     std::vector<Hit> search_faiss(const float * query, int top_k,
                                   const std::vector<faiss::idx_t> & candidate_rows) const {
-        if (!faiss || top_k <= 0 || rows.empty()) {
+        if (!faiss || top_k <= 0 || rows.size() <= n_tombstones) {
             return {};
         }
 
         const bool restricted = !candidate_rows.empty();
-        const int n = restricted
+        // Over-fetch when tombstones exist so filtering still yields top_k live hits.
+        const int live = (int) (rows.size() - n_tombstones);
+        const int want = restricted
             ? std::min(top_k, (int) candidate_rows.size())
-            : std::min(top_k, (int) rows.size());
-        if (n <= 0) {
+            : std::min(top_k, live);
+        if (want <= 0) {
             return {};
         }
+        const int n = restricted
+            ? want
+            : std::min((int) rows.size(), want + (int) n_tombstones);
 
         std::vector<float> scores((size_t) n);
         std::vector<faiss::idx_t> labels((size_t) n);
@@ -275,11 +331,14 @@ private:
         }
 
         std::vector<Hit> out;
-        out.reserve((size_t) n);
-        for (int i = 0; i < n; ++i) {
+        out.reserve((size_t) want);
+        for (int i = 0; i < n && (int) out.size() < want; ++i) {
             const faiss::idx_t r = labels[(size_t) i];
             if (r < 0 || r >= (faiss::idx_t) rows.size()) {
-                continue; // FAISS pads unused slots with -1
+                continue;
+            }
+            if (rows[(size_t) r].name.empty()) {
+                continue; // tombstone
             }
             out.push_back({rows[(size_t) r].name, rows[(size_t) r].module, scores[(size_t) i]});
         }
@@ -362,9 +421,14 @@ private:
             throw std::runtime_error("cannot open cache temps");
         }
 
+        // On-disk FAISS order = concatenation of each module's row_ids.
+        // Copy vectors via get_xb() (no per-row reconstruct) then one bulk add.
         names.write(NAMES_MAGIC, 8);
         write_u32(names, (uint32_t) modules.size());
-        std::vector<float> emb((size_t) dim);
+        std::vector<float> packed;
+        packed.reserve(rows.size() * (size_t) std::max(dim, 0));
+        const float * xb = (faiss && dim > 0) ? faiss->get_xb() : nullptr;
+
         for (const auto & item : modules) {
             write_str(names, item.first);
             write_str(names, item.second.version_token);
@@ -375,13 +439,18 @@ private:
             write_u32(names, (uint32_t) item.second.row_ids.size());
             for (faiss::idx_t r : item.second.row_ids) {
                 write_str(names, rows[(size_t) r].name);
-                faiss->reconstruct(r, emb.data());
-                out->add(1, emb.data());
+                if (xb) {
+                    const float * v = xb + (size_t) r * (size_t) dim;
+                    packed.insert(packed.end(), v, v + dim);
+                }
             }
         }
         names.close();
         if (!names) {
             throw std::runtime_error("cannot finish names file");
+        }
+        if (!packed.empty()) {
+            out->add((faiss::idx_t) (packed.size() / (size_t) dim), packed.data());
         }
         faiss::write_index(out.get(), vecs_tmp.c_str());
     }

@@ -137,12 +137,15 @@ void premise_setup(server_context & ctx_server,
 
     llama_model * model = const_cast<llama_model *>(llama_get_model(server_ctx));
 
-    // One embedding context. n_seq_max > 1 so /cache can pack many decls per decode.
+    // Batch window can exceed n_ctx_train so many short decls pack into one
+    // decode. Each sequence is still truncated to n_ctx_train (RoPE limit).
+    const uint32_t n_ctx_train = (uint32_t) (std::max)(1, llama_model_n_ctx_train(model));
+    const uint32_t n_batch_window = (std::max)(n_ctx_train, 4096u);
     llama_context_params embed_params = llama_context_default_params();
-    embed_params.n_ctx = (std::min)(2048u, (uint32_t) (std::max)(1, llama_model_n_ctx_train(model)));
-    embed_params.n_batch = embed_params.n_ctx;
-    embed_params.n_ubatch = embed_params.n_ctx;
-    embed_params.n_seq_max = (std::min)(embed_params.n_ctx, (uint32_t) llama_max_parallel_sequences());
+    embed_params.n_ctx = n_batch_window;
+    embed_params.n_batch = n_batch_window;
+    embed_params.n_ubatch = n_batch_window;
+    embed_params.n_seq_max = (std::min)(256u, (uint32_t) llama_max_parallel_sequences());
     embed_params.embeddings = true;
     embed_params.kv_unified = true;
     embed_params.pooling_type = llama_pooling_type(server_ctx);
@@ -199,7 +202,8 @@ void premise_cleanup() {
 
 static std::vector<llama_token> tokenize_for_embed(llama_context * ctx, const std::string & text) {
     auto tokens = common_tokenize(ctx, text, /*add_special*/ false, /*parse_special*/ true);
-    const int max_tokens = (std::max)(1, (std::min)((int) llama_n_ctx(ctx), (int) llama_n_batch(ctx)));
+    // Cap each sequence at the model's trained context (not the batch window).
+    const int max_tokens = (std::max)(1, llama_model_n_ctx_train(llama_get_model(ctx)));
     if ((int) tokens.size() > max_tokens) {
         tokens.resize((size_t) max_tokens);
     }
