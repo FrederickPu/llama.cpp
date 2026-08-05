@@ -1,14 +1,13 @@
 """
-Standalone premise-server demo and regression test.
+Demo and regression test for llama-server --premise.
 
-The premise-server is the embedding-only server used by CanonicalDrafter to
-rank Lean premises. It does not generate text. The intended flow is:
+Premise mode is embedding-only retrieval used by CanonicalDrafter to rank Lean
+premises. It does not generate text. The intended flow is:
 
-  1. Start premise-server with a GGUF embedding model.
-  2. Pass --index-vecs and --index-names so declaration embeddings persist.
-  3. Ask /version whether one Lean module is already cached.
-  4. Send that module's declarations to /cache when the version token is missing or stale.
-  5. Call /select with imports, local declarations, a goal, and k.
+  1. Start: llama-server --premise --model ... --index-vecs ... --index-names ...
+  2. Ask /version whether one Lean module is already cached.
+  3. Send that module's declarations to /cache when the version token is missing or stale.
+  4. Call /select with imports, local declarations, a goal, and k.
 
 Run with --print-guide to see the equivalent manual commands and JSON bodies.
 """
@@ -33,7 +32,7 @@ if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8")
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 LLAMA_DIR = REPO_ROOT
 BUILD_DIR = REPO_ROOT / "build"
 BUILD_BIN_DIR = BUILD_DIR / "bin"
@@ -96,30 +95,30 @@ def build_target(target: str) -> None:
     subprocess.check_call(["cmake", "--build", str(BUILD_DIR), "--target", target], cwd=REPO_ROOT)
 
 
-def find_premise_server(server_bin: Path | None) -> Path:
+def find_llama_server(server_bin: Path | None) -> Path:
     if server_bin:
         return server_bin
-    premise_server = find_exe("premise-server")
-    if premise_server:
-        return premise_server
+    server = find_exe("llama-server")
+    if server:
+        return server
 
-    print("premise-server not found; building target premise-server...", flush=True)
-    build_target("premise-server")
-    premise_server = find_exe("premise-server")
-    if not premise_server:
-        die("Failed to locate premise-server after building it")
-    return premise_server
+    print("llama-server not found; building target llama-server...", flush=True)
+    build_target("llama-server")
+    server = find_exe("llama-server")
+    if not server:
+        die("Failed to locate llama-server after building it")
+    return server
 
 
 def premise_server_command(args: argparse.Namespace) -> list[str]:
     command = [
-        str(find_premise_server(args.server_bin)),
+        str(find_llama_server(args.server_bin)),
+        "--premise",
         "--host", args.host,
         "--port", str(args.port),
         "--model", str(args.model),
         "--pooling", args.pooling,
         "--ctx-size", str(args.ctx_size),
-        "--parallel", str(args.parallel),
         "--index-vecs", str(args.index_vecs),
         "--index-names", str(args.index_names),
     ]
@@ -136,7 +135,7 @@ class ManagedPremiseServer:
     def __enter__(self) -> "ManagedPremiseServer":
         if not self.args.model.exists():
             die(
-                f"Premise-server GGUF does not exist: {self.args.model}\n"
+                f"Premise GGUF does not exist: {self.args.model}\n"
                 f"Expected Thomas Zhu model: {THOMAS_ZHU_MODEL_ID} revision {THOMAS_ZHU_MODEL_REVISION}"
             )
         self.args.index_vecs.parent.mkdir(parents=True, exist_ok=True)
@@ -151,7 +150,7 @@ class ManagedPremiseServer:
         self.log_file = open(log_path, "w", encoding="utf-8")
 
         command = premise_server_command(self.args)
-        print("Starting premise-server:", " ".join(command), flush=True)
+        print("Starting llama-server --premise:", " ".join(command), flush=True)
 
         creationflags = 0
         if os.name == "nt":
@@ -175,20 +174,20 @@ class ManagedPremiseServer:
 
         while time.time() < deadline:
             if self.process and self.process.poll() is not None:
-                die(f"premise-server exited early with code {self.process.returncode}; see {self.log_file.name}")
+                die(f"llama-server exited early with code {self.process.returncode}; see {self.log_file.name}")
             try:
                 with urllib.request.urlopen(health_url, timeout=2) as response:
                     if response.status == 200:
-                        print(f"premise-server ready at {health_url}", flush=True)
+                        print(f"premise mode ready at {health_url}", flush=True)
                         return
             except Exception:
                 time.sleep(0.5)
 
-        die(f"Timed out waiting for premise-server; see {self.log_file.name}")
+        die(f"Timed out waiting for llama-server --premise; see {self.log_file.name}")
 
     def __exit__(self, exc_type, exc, tb) -> None:
         if self.process and self.process.poll() is None:
-            print("Stopping premise-server", flush=True)
+            print("Stopping llama-server", flush=True)
             if os.name == "nt":
                 try:
                     os.kill(self.process.pid, signal.CTRL_C_EVENT)
@@ -238,7 +237,7 @@ def dump_json(data: dict) -> str:
 
 
 def run_tests(args: argparse.Namespace) -> bool:
-    print(f"Using premise-server at {BASE_URL}", flush=True)
+    print(f"Using premise mode at {BASE_URL}", flush=True)
 
     print(f"1. Checking /version for uncached module {DEMO_MODULE!r}", flush=True)
     before = post_json("/version", {"module": DEMO_MODULE})
@@ -266,13 +265,13 @@ def run_tests(args: argparse.Namespace) -> bool:
         print(f"[FAIL] /select returned malformed suggestions: {suggestions!r}", file=sys.stderr)
         return False
 
-    print("premise-server demo OK. Suggestions:", flush=True)
+    print("premise mode demo OK. Suggestions:", flush=True)
     print(json.dumps(suggestions, indent=2), flush=True)
     return True
 
 
 def print_usage_guide(args: argparse.Namespace) -> None:
-    premise_server_exe = args.server_bin or find_exe("premise-server") or (BUILD_BIN_DIR / ("premise-server.exe" if os.name == "nt" else "premise-server"))
+    server_exe = args.server_bin or find_exe("llama-server") or (BUILD_BIN_DIR / ("llama-server.exe" if os.name == "nt" else "llama-server"))
     version_request = dump_json({"module": DEMO_MODULE})
     cache_request = dump_json(cache_body())
     select_request = dump_json(select_body())
@@ -296,7 +295,7 @@ Build
 -----
 
    cmake -S {LLAMA_DIR} -B {BUILD_DIR} {' '.join(CMAKE_CONFIGURE_ARGS)}
-   cmake --build {BUILD_DIR} --target premise-server
+   cmake --build {BUILD_DIR} --target llama-server
 
 Start
 -----
@@ -307,8 +306,8 @@ The cache is a pair of files rewritten together on /cache:
 Pretty-printed declaration strings are sent by Lean only to compute embeddings;
 they are not stored in either file.
 
-   {premise_server_exe} --host {args.host} --port {args.port} --model {args.model} {line_continue}
-       --pooling {args.pooling} --ctx-size {args.ctx_size} --parallel {args.parallel} {line_continue}
+   {server_exe} --premise --host {args.host} --port {args.port} --model {args.model} {line_continue}
+       --pooling {args.pooling} --ctx-size {args.ctx_size} {line_continue}
        --index-vecs {args.index_vecs} {line_continue}
        --index-names {args.index_names}
 
@@ -365,42 +364,40 @@ Notes
   - --index-vecs stores embeddings; --index-names stores module/name identity.
     Both are updated together. Declaration strings are not persisted.
   - Lean decides which declarations belong to each module and sends fully
-    qualified names through /cache; premise-server does not infer module
-    membership itself.
+    qualified names through /cache; the server does not infer module membership.
   - /version and /cache are one module per request.
-   - /select can include unsaved local declarations in the request body.
-  - --url runs the same /version, /cache, and /select demo against an existing
-    compatible premise-server and will refresh {DEMO_MODULE} in that process.
+  - /select can include unsaved local declarations in the request body.
+  - --url runs the same demo against an existing premise-mode server and will
+    refresh {DEMO_MODULE} in that process.
 """
     print(guide.strip())
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Start premise-server and demonstrate /version, /cache, and /select.",
+        description="Start llama-server --premise and demonstrate /version, /cache, and /select.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""
         Common flows:
-          python tools/premise-server/test_regression.py --print-guide
-          python tools/premise-server/test_regression.py
-          python tools/premise-server/test_regression.py --url http://127.0.0.1:8081
+          python tools/server/premise/test_regression.py --print-guide
+          python tools/server/premise/test_regression.py
+          python tools/server/premise/test_regression.py --url http://127.0.0.1:8081
         """),
     )
     parser.add_argument("--print-guide", action="store_true", help="Print manual build/start/query commands and exit")
-    parser.add_argument("--url", help="Use an already-running compatible premise-server; refreshes the demo module in that process")
+    parser.add_argument("--url", help="Use an already-running premise-mode server; refreshes the demo module in that process")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8081)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL, help="GGUF embedding model")
     parser.add_argument("--pooling", default="mean")
     parser.add_argument("--ctx-size", type=int, default=512)
-    parser.add_argument("--parallel", type=int, default=2, help="Number of embedding contexts used by premise-server")
     parser.add_argument("--index-vecs", type=Path, default=DEFAULT_INDEX_VECS, help="Persistent embedding vector cache")
     parser.add_argument("--index-names", dest="index_names", type=Path, default=DEFAULT_INDEX_NAMES, help="Module/name side of the persistent cache pair")
     parser.add_argument("--index-strings", dest="index_names", type=Path, help="Deprecated alias for --index-names")
     parser.add_argument("--startup-timeout", type=int, default=180)
-    parser.add_argument("--server-bin", type=Path, help="Path to premise-server executable")
+    parser.add_argument("--server-bin", type=Path, help="Path to llama-server executable")
     parser.add_argument("--server-log", type=Path)
-    parser.add_argument("--server-arg", action="append", help="Extra argument passed to premise-server; repeat as needed")
+    parser.add_argument("--server-arg", action="append", help="Extra argument passed to llama-server; repeat as needed")
     return parser.parse_args()
 
 

@@ -12,7 +12,6 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -63,41 +62,6 @@ struct PremiseIndex {
         vecs_path.clear();
         names_path.clear();
         clear(model_dim);
-    }
-
-    void load_offline(const char * faiss_file, const char * names_json, int max_rows = 0) {
-        std::lock_guard<std::mutex> lock(mu);
-        vecs_path.clear();
-        names_path.clear();
-
-        auto names = read_json_strings(names_json);
-        auto index = read_faiss(faiss_file);
-        if (index->ntotal > std::numeric_limits<int>::max()) {
-            throw std::runtime_error("too many FAISS rows");
-        }
-        const int total = (int) index->ntotal;
-        const int n = max_rows > 0 ? std::min(max_rows, total) : total;
-        if ((int) names.size() < n) {
-            throw std::runtime_error("names file shorter than FAISS index");
-        }
-
-        dim = (int) index->d;
-        modules.clear();
-        rows.resize((size_t) n);
-        for (int i = 0; i < n; ++i) {
-            rows[(size_t) i] = {std::move(names[(size_t) i]), ""};
-        }
-        if (n == total) {
-            faiss = std::move(index);
-        } else {
-            faiss = make_faiss(dim);
-            std::vector<float> emb((size_t) dim);
-            for (int i = 0; i < n; ++i) {
-                index->reconstruct(i, emb.data());
-                faiss->add(1, emb.data());
-            }
-        }
-        dirty = false;
     }
 
     void load_cache(const std::string & vecs_file, const std::string & names_file, int model_dim) {
@@ -442,16 +406,6 @@ private:
         }
         idx.release();
         return std::unique_ptr<faiss::IndexFlat>(flat);
-    }
-
-    static std::vector<std::string> read_json_strings(const char * path) {
-        std::ifstream in(path);
-        if (!in) {
-            throw std::runtime_error(std::string("cannot open ") + path);
-        }
-        nlohmann::json j;
-        in >> j;
-        return j.get<std::vector<std::string>>();
     }
 
     static void read_u32(std::istream & in, uint32_t & v) {

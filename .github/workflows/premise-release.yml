@@ -1,11 +1,12 @@
 name: Premise Release
 
-# Builds llama-server + premise-server for the six platforms CanonicalDrafter's
-# Llama.lean supports, and publishes them as self-contained archives on a
-# GitHub release. Unlike upstream release.yml (which splits Windows backends
-# into separate DLL-only zips), every archive here contains all binaries and
-# backend libraries needed to run on that platform, because the Lean side
-# downloads exactly one asset per platform.
+# Builds llama-server (PremiseServer=ON, so runtime `llama-server --premise`
+# is available) for the six platforms CanonicalDrafter's Llama.lean supports,
+# and publishes them as self-contained archives on a GitHub release. Unlike
+# upstream release.yml (which splits Windows backends into separate DLL-only
+# zips), every archive here contains all binaries and backend libraries needed
+# to run on that platform, because the Lean side downloads exactly one asset
+# per platform.
 #
 # Asset names follow the upstream pattern Llama.lean already parses:
 #   llama-<tag>-bin-macos-arm64.tar.gz        (Metal)
@@ -253,4 +254,4 @@ jobs:
             --repo "${{ github.repository }}" \
             --target "${{ github.sha }}" \
             --title "$TAG" \
-            --notes "llama-server + premise-server builds for CanonicalDrafter (see tools/premise-server)."
+            --notes "llama-server builds for CanonicalDrafter (PremiseServer=ON; run with llama-server --premise; see tools/server/premise/)."

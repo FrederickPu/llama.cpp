@@ -48,6 +48,44 @@ if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} LIBRARY)
 endif()
 
+# Optional premise retrieval mode (--premise), built into llama-server
+if (PremiseServer)
+    set(_ROOT_DIR "${CMAKE_SOURCE_DIR}")
+
+    add_library(llama-server-premise STATIC
+        premise/premise.cpp
+    )
+    target_include_directories(llama-server-premise PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/premise
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${_ROOT_DIR}
+        ${_ROOT_DIR}/include
+        ${_ROOT_DIR}/common
+        ${_ROOT_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/../mtmd
+        ${_ROOT_DIR}/vendor
+        ${_ROOT_DIR}/vendor/nlohmann
+    )
+    target_link_libraries(llama-server-premise PUBLIC llama llama-common)
+    target_compile_features(llama-server-premise PUBLIC cxx_std_17)
+
+    if (NOT TARGET faiss AND NOT TARGET faiss::faiss)
+        find_package(faiss CONFIG QUIET)
+    endif()
+    if (NOT TARGET faiss AND NOT TARGET faiss::faiss)
+        add_subdirectory(${_ROOT_DIR}/vendor/faiss ${CMAKE_BINARY_DIR}/vendor/faiss)
+    endif()
+    if (TARGET faiss)
+        set(_premise_faiss_target faiss)
+    elseif (TARGET faiss::faiss)
+        set(_premise_faiss_target faiss::faiss)
+    else()
+        message(FATAL_ERROR "FAISS was found, but no known CMake target was exported")
+    endif()
+    target_link_libraries(llama-server-premise PUBLIC ${_premise_faiss_target})
+    message(STATUS "llama-server: premise mode enabled (use --premise)")
+endif()
+
 # llama-server executable
 
 set(TARGET llama-server)
@@ -57,3 +95,8 @@ install(TARGETS ${TARGET} RUNTIME)
 
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+if (TARGET llama-server-premise)
+    target_compile_definitions(${TARGET} PRIVATE LLAMA_PREMISE_SERVER)
+    target_link_libraries(${TARGET} PRIVATE llama-server-premise)
+endif()

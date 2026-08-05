@@ -4,19 +4,26 @@
 #include "server-context.h"
 #include "server-http.h"
 
+#include "arg.h"
 #include "common.h"
 #include "llama.h"
 #include "log.h"
 
 #include <nlohmann/json.hpp>
 
-#include <chrono>
-#include <condition_variable>
+#include <atomic>
+#include <clocale>
+#include <csignal>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
-#include <unordered_map>
+#include <thread>
 #include <vector>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 using json = nlohmann::ordered_json;
 
@@ -26,12 +33,12 @@ using json = nlohmann::ordered_json;
 
 struct LocalDecl {
     std::string name;
-    std::string body; // source text used only to embed; never stored in the index
+    std::string body; // embed only; never stored in the index
 };
 
 struct SelectParams {
     int top_k = 0;
-    bool use_scoped_search = false; // true if request has imports and/or locals
+    bool use_scoped_search = false;
     std::vector<std::string> imports;
     std::vector<LocalDecl> local_decls;
 };
@@ -39,22 +46,14 @@ struct SelectParams {
 struct PremiseState {
     llama_context * embed_ctx = nullptr;
     std::unique_ptr<PremiseIndex> index;
-    llama_token embed_token = -1; // optional [EMB] for joint models
     int embed_dim = 0;
-    bool joint_retrieval = false;
     std::mutex embed_mutex;
-
-    // Joint stream handshake only (server loop <-> HTTP).
-    std::mutex joint_mutex;
-    std::condition_variable joint_cv;
-    std::unordered_map<int, SelectParams> joint_select_by_task;
-    std::unordered_map<int, std::string> joint_sse_by_task;
 };
 
 static PremiseState * g_premise = nullptr;
 
 // ---------------------------------------------------------------------------
-// Small JSON / HTTP helpers
+// JSON / HTTP helpers
 // ---------------------------------------------------------------------------
 
 static std::string json_string(const json & obj, const char * key, const std::string & fallback = {}) {
@@ -112,14 +111,10 @@ static server_http_res_ptr make_error_response(const std::exception & e) {
     return res;
 }
 
-static json hits_to_json(const std::vector<PremiseIndex::Hit> & hits, bool include_module) {
+static json hits_to_json(const std::vector<PremiseIndex::Hit> & hits) {
     json arr = json::array();
     for (const auto & hit : hits) {
-        json item = {{"name", hit.name}, {"score", hit.score}};
-        if (include_module && !hit.module.empty()) {
-            item["module"] = hit.module;
-        }
-        arr.push_back(std::move(item));
+        arr.push_back({{"name", hit.name}, {"score", hit.score}});
     }
     return arr;
 }
@@ -130,12 +125,7 @@ static json hits_to_json(const std::vector<PremiseIndex::Hit> & hits, bool inclu
 
 void premise_setup(server_context & ctx_server,
                    const std::string & vecs_path,
-                   const std::string & names_path,
-                   PremiseMode mode) {
-    const bool has_cache_paths = !vecs_path.empty() && !names_path.empty();
-    if (!has_cache_paths && mode == PremiseMode::Auto) {
-        return;
-    }
+                   const std::string & names_path) {
     if (vecs_path.empty() != names_path.empty()) {
         SRV_WRN("%s", "--index-vecs and --index-names must both be set\n");
     }
@@ -146,28 +136,13 @@ void premise_setup(server_context & ctx_server,
     }
 
     llama_model * model = const_cast<llama_model *>(llama_get_model(server_ctx));
-    const llama_vocab * vocab = llama_model_get_vocab(model);
-
-    llama_token embed_token = -1;
-    char piece[64];
-    for (int i = llama_vocab_n_tokens(vocab) - 1; i >= 0; --i) {
-        const int n = llama_token_to_piece(vocab, i, piece, sizeof(piece), 0, true);
-        if (n > 0 && std::string(piece, n) == "[EMB]") {
-            embed_token = i;
-            break;
-        }
-    }
-    if (mode == PremiseMode::Joint && embed_token < 0) {
-        SRV_ERR("%s", "joint mode needs [EMB] token\n");
-        return;
-    }
 
     // One embedding context. n_seq_max > 1 so /cache can pack many decls per decode.
     llama_context_params embed_params = llama_context_default_params();
-    embed_params.n_ctx = std::min(2048u, (uint32_t) std::max(1, llama_model_n_ctx_train(model)));
+    embed_params.n_ctx = (std::min)(2048u, (uint32_t) (std::max)(1, llama_model_n_ctx_train(model)));
     embed_params.n_batch = embed_params.n_ctx;
     embed_params.n_ubatch = embed_params.n_ctx;
-    embed_params.n_seq_max = std::min(embed_params.n_ctx, (uint32_t) llama_max_parallel_sequences());
+    embed_params.n_seq_max = (std::min)(embed_params.n_ctx, (uint32_t) llama_max_parallel_sequences());
     embed_params.embeddings = true;
     embed_params.kv_unified = true;
     embed_params.pooling_type = llama_pooling_type(server_ctx);
@@ -181,33 +156,19 @@ void premise_setup(server_context & ctx_server,
     try {
         const int embed_dim = llama_model_n_embd_out(model);
         auto index = std::make_unique<PremiseIndex>();
-        if (mode == PremiseMode::Embedding) {
-            if (has_cache_paths) {
-                index->load_cache(vecs_path, names_path, embed_dim);
-            } else {
-                index->initialize_empty(embed_dim);
-            }
-        } else if (has_cache_paths) {
-            index->load_offline(vecs_path.c_str(), names_path.c_str());
-            if (index->embedding_dim() != embed_dim) {
-                SRV_ERR("%s", "index dim mismatch; offline index disabled\n");
-                index.reset();
-            }
+        if (!vecs_path.empty() && !names_path.empty()) {
+            index->load_cache(vecs_path, names_path, embed_dim);
         } else {
-            index.reset();
+            index->initialize_empty(embed_dim);
         }
 
         auto state = std::make_unique<PremiseState>();
         state->embed_ctx = embed_ctx;
-        state->embed_token = embed_token;
-        state->joint_retrieval = mode != PremiseMode::Embedding && embed_token >= 0;
         state->embed_dim = embed_dim;
         state->index = std::move(index);
         g_premise = state.release();
 
-        SRV_INF("premise ready: rows=%d joint=%d\n",
-                g_premise->index ? (int) g_premise->index->size() : 0,
-                (int) g_premise->joint_retrieval);
+        SRV_INF("premise ready: rows=%d\n", (int) g_premise->index->size());
     } catch (const std::exception & e) {
         SRV_ERR("premise init failed: %s\n", e.what());
         llama_free(embed_ctx);
@@ -231,14 +192,92 @@ void premise_cleanup() {
 // ---------------------------------------------------------------------------
 // Embedding
 //
-// Only multi-declaration batching matters (one /cache module's decls).
-// One context; embed_mutex serializes any overlapping callers.
+// /cache sends many declaration strings. We tokenize them, pack as many as
+// fit into one llama_batch (by token budget and n_seq_max), decode, read one
+// embedding per sequence, then repeat for the rest.
 // ---------------------------------------------------------------------------
 
-// Pack independent token sequences into llama_batch slots and decode.
+static std::vector<llama_token> tokenize_for_embed(llama_context * ctx, const std::string & text) {
+    auto tokens = common_tokenize(ctx, text, /*add_special*/ false, /*parse_special*/ true);
+    const int max_tokens = (std::max)(1, (std::min)((int) llama_n_ctx(ctx), (int) llama_n_batch(ctx)));
+    if ((int) tokens.size() > max_tokens) {
+        tokens.resize((size_t) max_tokens);
+    }
+    if (tokens.empty()) {
+        throw std::runtime_error("tokenization produced no tokens");
+    }
+    return tokens;
+}
+
+// Add one token sequence as seq_id. Returns batch index of its last token.
+static int batch_add_sequence(
+        llama_batch & batch,
+        const std::vector<llama_token> & tokens,
+        llama_seq_id seq_id,
+        enum llama_pooling_type pooling) {
+    for (int i = 0; i < (int) tokens.size(); ++i) {
+        const bool need_output =
+            pooling != LLAMA_POOLING_TYPE_NONE || i + 1 == (int) tokens.size();
+        common_batch_add(batch, tokens[i], i, { seq_id }, need_output);
+    }
+    return batch.n_tokens - 1;
+}
+
+// Decode one packed batch; write normalized embeddings for sequences [begin, end).
+static void decode_embedding_chunk(
+        llama_context * ctx,
+        llama_batch & batch,
+        const std::vector<std::vector<llama_token>> & sequences,
+        size_t begin,
+        size_t end,
+        enum llama_pooling_type pooling,
+        int n_embd,
+        std::vector<std::vector<float>> & out) {
+    common_batch_clear(batch);
+    std::vector<int> last_token_pos;
+    last_token_pos.reserve(end - begin);
+
+    for (size_t i = begin; i < end; ++i) {
+        const llama_seq_id seq_id = (llama_seq_id) (i - begin);
+        last_token_pos.push_back(batch_add_sequence(batch, sequences[i], seq_id, pooling));
+    }
+
+    llama_memory_clear(llama_get_memory(ctx), true);
+    if (llama_decode(ctx, batch) != 0) {
+        throw std::runtime_error("embedding decode failed");
+    }
+
+    for (size_t i = begin; i < end; ++i) {
+        const int seq_id = (int) (i - begin);
+        const float * raw = pooling == LLAMA_POOLING_TYPE_NONE
+            ? llama_get_embeddings_ith(ctx, last_token_pos[(size_t) seq_id])
+            : llama_get_embeddings_seq(ctx, seq_id);
+        if (!raw) {
+            throw std::runtime_error("missing embedding");
+        }
+        common_embd_normalize(raw, out[i].data(), n_embd, 2);
+    }
+}
+
+// How many sequences starting at `begin` fit in one batch.
+static size_t count_sequences_for_chunk(
+        const std::vector<std::vector<llama_token>> & sequences,
+        size_t begin,
+        int n_batch,
+        int n_seq_max) {
+    size_t end = begin;
+    int n_tokens = 0;
+    while (end < sequences.size() &&
+            (int) (end - begin) < n_seq_max &&
+            n_tokens + (int) sequences[end].size() <= n_batch) {
+        n_tokens += (int) sequences[end].size();
+        ++end;
+    }
+    return end;
+}
+
 static std::vector<std::vector<float>> embed_token_batch(
-        std::vector<std::vector<llama_token>> sequences,
-        bool append_embed_token) {
+        std::vector<std::vector<llama_token>> sequences) {
     if (!g_premise || !g_premise->embed_ctx) {
         throw std::runtime_error("premise not initialized");
     }
@@ -248,71 +287,19 @@ static std::vector<std::vector<float>> embed_token_batch(
 
     std::lock_guard<std::mutex> lock(g_premise->embed_mutex);
     llama_context * ctx = g_premise->embed_ctx;
-
-    if (append_embed_token) {
-        if (g_premise->embed_token < 0) {
-            throw std::runtime_error("no [EMB] token");
-        }
-        for (auto & tokens : sequences) {
-            tokens.push_back(g_premise->embed_token);
-        }
-    }
-
     const int n_batch = (int) llama_n_batch(ctx);
     const int n_seq_max = (int) llama_n_seq_max(ctx);
-    const int max_tokens = std::min((int) llama_n_ctx(ctx), n_batch);
     const enum llama_pooling_type pooling = llama_pooling_type(ctx);
     const int n_embd = g_premise->embed_dim > 0
         ? g_premise->embed_dim
         : llama_model_n_embd_out(llama_get_model(ctx));
 
-    for (auto & tokens : sequences) {
-        if (tokens.empty()) {
-            throw std::runtime_error("empty token sequence");
-        }
-        if ((int) tokens.size() > max_tokens) {
-            tokens.erase(tokens.begin(), tokens.begin() + ((int) tokens.size() - max_tokens));
-        }
-    }
-
     std::vector<std::vector<float>> embeddings(sequences.size(), std::vector<float>(n_embd));
     llama_batch batch = llama_batch_init(n_batch, 0, 1);
     try {
         for (size_t begin = 0; begin < sequences.size(); ) {
-            common_batch_clear(batch);
-            std::vector<int> last_token_pos;
-            size_t end = begin;
-
-            // Fit as many sequences as n_batch / n_seq_max allow.
-            while (end < sequences.size() &&
-                    end - begin < (size_t) n_seq_max &&
-                    batch.n_tokens + (int) sequences[end].size() <= n_batch) {
-                const llama_seq_id seq_id = (llama_seq_id) (end - begin);
-                const auto & tokens = sequences[end];
-                for (int i = 0; i < (int) tokens.size(); ++i) {
-                    const bool output =
-                        pooling != LLAMA_POOLING_TYPE_NONE || i + 1 == (int) tokens.size();
-                    common_batch_add(batch, tokens[i], i, { seq_id }, output);
-                }
-                last_token_pos.push_back(batch.n_tokens - 1);
-                ++end;
-            }
-
-            llama_memory_clear(llama_get_memory(ctx), true);
-            if (llama_decode(ctx, batch) != 0) {
-                throw std::runtime_error("embedding decode failed");
-            }
-
-            for (size_t i = begin; i < end; ++i) {
-                const int seq_id = (int) (i - begin);
-                const float * raw = pooling == LLAMA_POOLING_TYPE_NONE
-                    ? llama_get_embeddings_ith(ctx, last_token_pos[(size_t) seq_id])
-                    : llama_get_embeddings_seq(ctx, seq_id);
-                if (!raw) {
-                    throw std::runtime_error("missing embedding");
-                }
-                common_embd_normalize(raw, embeddings[i].data(), n_embd, 2);
-            }
+            const size_t end = count_sequences_for_chunk(sequences, begin, n_batch, n_seq_max);
+            decode_embedding_chunk(ctx, batch, sequences, begin, end, pooling, n_embd, embeddings);
             begin = end;
         }
     } catch (...) {
@@ -321,15 +308,6 @@ static std::vector<std::vector<float>> embed_token_batch(
     }
     llama_batch_free(batch);
     return embeddings;
-}
-
-static std::vector<llama_token> tokenize_for_embed(const std::string & text) {
-    auto tokens = common_tokenize(g_premise->embed_ctx, text, /*add_special*/ false, /*parse_special*/ true);
-    const int max_tokens = std::max(1, (int) llama_n_ctx(g_premise->embed_ctx) - 1);
-    if ((int) tokens.size() > max_tokens) {
-        tokens.resize((size_t) max_tokens);
-    }
-    return tokens;
 }
 
 static std::vector<PremiseIndex::Candidate> embed_declarations(
@@ -341,9 +319,9 @@ static std::vector<PremiseIndex::Candidate> embed_declarations(
     for (size_t i = 0; i < decls.size(); ++i) {
         out[i].name = decls[i].name;
         out[i].module = module;
-        sequences.push_back(tokenize_for_embed(decls[i].body));
+        sequences.push_back(tokenize_for_embed(g_premise->embed_ctx, decls[i].body));
     }
-    auto vectors = embed_token_batch(std::move(sequences), /*append_embed_token*/ false);
+    auto vectors = embed_token_batch(std::move(sequences));
     for (size_t i = 0; i < out.size(); ++i) {
         out[i].embedding = std::move(vectors[i]);
     }
@@ -351,7 +329,7 @@ static std::vector<PremiseIndex::Candidate> embed_declarations(
 }
 
 // ---------------------------------------------------------------------------
-// Select core (shared by HTTP /select and joint hooks)
+// Select
 // ---------------------------------------------------------------------------
 
 static SelectParams select_params_from_json(const json & data, int top_k) {
@@ -359,7 +337,6 @@ static SelectParams select_params_from_json(const json & data, int top_k) {
     params.top_k = top_k;
     params.imports = json_string_array(data, "imports");
     params.local_decls = json_local_decls(data);
-    // Key presence chooses scoped vs global, including empty arrays.
     params.use_scoped_search = data.contains("imports") || data.contains("declarations");
     return params;
 }
@@ -379,100 +356,10 @@ static std::vector<PremiseIndex::Hit> select_hits(
 }
 
 // ---------------------------------------------------------------------------
-// Joint hooks
-//
-// task_created: store SelectParams for this generation task
-// prefill_complete: embed prompt (+[EMB]), run select, store SSE prefix
-// take_initial_stream_prefix: HTTP waits for that SSE (or timeout)
-// ---------------------------------------------------------------------------
-
-std::string premise_task_created(int task_id, const json & data, bool stream, int n_cmpl) {
-    if (!g_premise) {
-        return {};
-    }
-    if (!g_premise->joint_retrieval) {
-        return "joint model with [EMB] required; use /select";
-    }
-    // Only single-completion streams request premises.
-    const int top_k = (stream && n_cmpl == 1)
-        ? json_int(data, "retrieval_topk", json_int(data, "k", 5))
-        : -1;
-    if (top_k < 0) {
-        return {};
-    }
-    SelectParams params = select_params_from_json(data, top_k);
-    if (!params.use_scoped_search && !g_premise->index) {
-        return {};
-    }
-    std::lock_guard<std::mutex> lock(g_premise->joint_mutex);
-    g_premise->joint_select_by_task[task_id] = std::move(params);
-    return {};
-}
-
-void premise_prefill_complete(int task_id, const std::vector<llama_token> & prompt_tokens) {
-    if (!g_premise || !g_premise->embed_ctx || !g_premise->joint_retrieval) {
-        return;
-    }
-
-    SelectParams params;
-    {
-        std::lock_guard<std::mutex> lock(g_premise->joint_mutex);
-        auto it = g_premise->joint_select_by_task.find(task_id);
-        if (it == g_premise->joint_select_by_task.end()) {
-            return;
-        }
-        params = it->second;
-    }
-
-    auto finish = [&](std::string sse) {
-        std::lock_guard<std::mutex> lock(g_premise->joint_mutex);
-        g_premise->joint_select_by_task.erase(task_id);
-        g_premise->joint_sse_by_task[task_id] = std::move(sse);
-        g_premise->joint_cv.notify_all();
-    };
-
-    if (params.top_k <= 0) {
-        finish({});
-        return;
-    }
-
-    try {
-        auto query = embed_token_batch({ prompt_tokens }, /*append_embed_token*/ true).front();
-        json event = {
-            {"type", "premises"},
-            {"premises", hits_to_json(select_hits(params, query), /*include_module*/ true)},
-        };
-        finish("data: " + event.dump() + "\n\n");
-    } catch (const std::exception & e) {
-        SRV_WRN("joint retrieval: %s\n", e.what());
-        finish({});
-    }
-}
-
-std::string premise_take_initial_stream_prefix(int task_id) {
-    if (!g_premise || task_id < 0) {
-        return {};
-    }
-    std::unique_lock<std::mutex> lock(g_premise->joint_mutex);
-    g_premise->joint_cv.wait_for(lock, std::chrono::seconds(10), [task_id] {
-        return g_premise->joint_sse_by_task.count(task_id) > 0 ||
-               g_premise->joint_select_by_task.count(task_id) == 0;
-    });
-    auto it = g_premise->joint_sse_by_task.find(task_id);
-    if (it == g_premise->joint_sse_by_task.end()) {
-        g_premise->joint_select_by_task.erase(task_id);
-        return {};
-    }
-    std::string sse = std::move(it->second);
-    g_premise->joint_sse_by_task.erase(it);
-    return sse;
-}
-
-// ---------------------------------------------------------------------------
 // HTTP: POST /version, /cache, /select
 // ---------------------------------------------------------------------------
 
-// /version { "module": "..." } -> token string | null
+// /version { "module": "..." } -> token | null
 static json handle_version(const json & body) {
     const std::string module = json_string(body, "module");
     if (!g_premise || !g_premise->index || module.empty()) {
@@ -482,7 +369,7 @@ static json handle_version(const json & body) {
     return token.empty() ? json(nullptr) : json(token);
 }
 
-// /cache one module; declarations[] are batch-embedded then replace_module.
+// /cache one module; declarations[] batch-embedded then replace_module
 static json handle_cache(const json & body) {
     if (!g_premise || !g_premise->index) {
         throw std::runtime_error("premise not initialized");
@@ -501,7 +388,7 @@ static json handle_cache(const json & body) {
     return json{{"ok", true}};
 }
 
-// /select goal + optional imports/locals -> [{name,score}, ...]
+// /select { goal, k, imports?, declarations? } -> [{name,score}, ...]
 static json handle_select(const json & body) {
     if (!g_premise) {
         throw std::runtime_error("premise not initialized");
@@ -511,10 +398,8 @@ static json handle_select(const json & body) {
         throw std::runtime_error("missing goal");
     }
     SelectParams params = select_params_from_json(body, json_int(body, "k", 5));
-    auto query = embed_token_batch(
-            { tokenize_for_embed(goal) },
-            /*append_embed_token*/ g_premise->joint_retrieval).front();
-    return hits_to_json(select_hits(params, query), /*include_module*/ false);
+    auto query = embed_token_batch({ tokenize_for_embed(g_premise->embed_ctx, goal) }).front();
+    return hits_to_json(select_hits(params, query));
 }
 
 void premise_register_http_routes(const server_http_context & ctx_http) {
@@ -532,4 +417,141 @@ void premise_register_http_routes(const server_http_context & ctx_http) {
     ctx_http.post("/version", post_json(handle_version));
     ctx_http.post("/cache",   post_json(handle_cache));
     ctx_http.post("/select",  post_json(handle_select));
+}
+
+// ---------------------------------------------------------------------------
+// Entry point (llama-server --premise)
+// ---------------------------------------------------------------------------
+
+static std::function<void(int)> g_shutdown_handler;
+static std::atomic_flag g_terminating = ATOMIC_FLAG_INIT;
+
+static void print_premise_usage(int, char **) {
+    printf("\n\n----- premise mode (llama-server --premise) -----\n\n");
+    printf("  --premise\n");
+    printf("      run as premise retrieval server instead of generation server\n\n");
+    printf("  --index-vecs FILE\n");
+    printf("      path to the FAISS premise index\n\n");
+    printf("  --index-names FILE, --index-strings FILE\n");
+    printf("      path to module/name side of the cache (aligned with --index-vecs)\n\n");
+}
+
+static void premise_signal_handler(int signal) {
+    if (g_terminating.test_and_set()) {
+        fprintf(stderr, "Received second interrupt, terminating immediately.\n");
+        exit(1);
+    }
+    if (g_shutdown_handler) {
+        g_shutdown_handler(signal);
+    }
+}
+
+static server_http_res_ptr health_ok(const server_http_req &) {
+    auto res = std::make_unique<server_http_res>();
+    res->data = "{\"status\":\"ok\"}";
+    return res;
+}
+
+int premise_server(int argc, char ** argv) {
+    std::setlocale(LC_NUMERIC, "C");
+
+    std::string vecs_path;
+    std::string names_path;
+    std::vector<char *> args;
+    args.push_back(argv[0]);
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "--premise") {
+            // Mode flag consumed by main dispatcher / this entry point.
+        } else if (a == "--index-vecs" && i + 1 < argc) {
+            vecs_path = argv[++i];
+        } else if ((a == "--index-names" || a == "--index-strings") && i + 1 < argc) {
+            names_path = argv[++i];
+        } else {
+            args.push_back(argv[i]);
+        }
+    }
+    argc = (int) args.size();
+    argv = args.data();
+
+    common_params params;
+    common_init();
+    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER, print_premise_usage)) {
+        return 1;
+    }
+
+    // Generation slots unused; one slot is enough for model load.
+    if (params.n_parallel < 0) {
+        params.n_parallel = 1;
+        params.kv_unified = true;
+    }
+
+    llama_backend_init();
+    llama_numa_init(params.numa);
+    common_params_print_info(params, true);
+
+    server_context ctx_server;
+    server_http_context ctx_http;
+    if (!ctx_http.init(params)) {
+        SRV_ERR("%s", "failed to initialize HTTP server\n");
+        llama_backend_free();
+        return 1;
+    }
+
+    ctx_http.get("/health", health_ok);
+    ctx_http.get("/v1/health", health_ok);
+    premise_register_http_routes(ctx_http);
+
+    auto clean_up = [&]() {
+        SRV_INF("%s: cleaning up before exit...\n", __func__);
+        ctx_http.stop();
+        ctx_server.terminate();
+        premise_cleanup();
+        llama_backend_free();
+    };
+
+    if (!ctx_http.start()) {
+        clean_up();
+        SRV_ERR("%s", "exiting due to HTTP server error\n");
+        return 1;
+    }
+
+    SRV_INF("%s", "loading model\n");
+    if (!ctx_server.load_model(params)) {
+        clean_up();
+        if (ctx_http.thread.joinable()) {
+            ctx_http.thread.join();
+        }
+        SRV_ERR("%s", "exiting due to model loading error\n");
+        return 1;
+    }
+
+    premise_setup(ctx_server, vecs_path, names_path);
+    ctx_http.is_ready.store(true);
+    SRV_INF("llama-server --premise listening on %s\n", ctx_http.listening_address.c_str());
+
+    g_shutdown_handler = [&](int) {
+        ctx_server.terminate();
+        ctx_http.stop();
+    };
+
+#if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
+    struct sigaction sigint_action;
+    sigint_action.sa_handler = premise_signal_handler;
+    sigemptyset(&sigint_action.sa_mask);
+    sigint_action.sa_flags = 0;
+    sigaction(SIGINT, &sigint_action, NULL);
+    sigaction(SIGTERM, &sigint_action, NULL);
+#elif defined (_WIN32)
+    auto console_ctrl_handler = +[](DWORD ctrl_type) -> BOOL {
+        return (ctrl_type == CTRL_C_EVENT) ? (premise_signal_handler(SIGINT), true) : false;
+    };
+    SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
+#endif
+
+    if (ctx_http.thread.joinable()) {
+        ctx_http.thread.join();
+    }
+    clean_up();
+    return 0;
 }
