@@ -1,23 +1,22 @@
 name: Premise Release
 
 # Builds llama-server (PremiseServer=ON, so runtime `llama-server --premise`
-# is available) for the six platforms CanonicalDrafter's Llama.lean supports,
-# and publishes them as self-contained archives on a GitHub release. Unlike
-# upstream release.yml (which splits Windows backends into separate DLL-only
-# zips), every archive here contains all binaries and backend libraries needed
-# to run on that platform, because the Lean side downloads exactly one asset
-# per platform.
+# is available) and publishes self-contained archives. Unlike upstream
+# release.yml (which splits Windows CUDA into bin + cudart zips), every
+# archive here has the binaries and runtime libs needed to run, because the
+# Lean side downloads exactly one asset per platform.
 #
-# Asset names follow the upstream pattern Llama.lean already parses:
-#   llama-<tag>-bin-macos-arm64.tar.gz        (Metal)
-#   llama-<tag>-bin-macos-x64.tar.gz          (CPU)
+# Assets:
+#   llama-<tag>-bin-macos-arm64.tar.gz          (Metal)
+#   llama-<tag>-bin-macos-x64.tar.gz            (CPU)
 #   llama-<tag>-bin-ubuntu-vulkan-x64.tar.gz
 #   llama-<tag>-bin-ubuntu-vulkan-arm64.tar.gz
 #   llama-<tag>-bin-win-vulkan-x64.zip
+#   llama-<tag>-bin-win-cuda-12.4-x64.zip       (CUDA + cudart bundled)
+#   llama-<tag>-bin-win-cuda-13.3-x64.zip
 #   llama-<tag>-bin-win-cpu-arm64.zip
 #
-# Trigger: any branch push, a premise-* tag (the tag becomes the release name
-# and the llamaCppTag constant on the Lean side), or workflow_dispatch.
+# Trigger: any branch push, a premise-* tag, or workflow_dispatch.
 
 on:
   workflow_dispatch:
@@ -232,8 +231,74 @@ jobs:
           path: llama-${{ needs.tag.outputs.name }}-bin-win-cpu-arm64.zip
           name: llama-bin-win-cpu-arm64.zip
 
+  # Full llama-server + CUDA backend + bundled cudart (one zip, not upstream's
+  # separate bin/cudart pair). Matrix matches upstream release CUDA versions.
+  windows-cuda-x64:
+    needs: [tag]
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        cuda: ['12.4', '13.3']
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Cuda Toolkit
+        uses: ./.github/actions/windows-setup-cuda
+        with:
+          cuda_version: ${{ matrix.cuda }}
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: premise-release-windows-2022-x64-cuda-${{ matrix.cuda }}
+
+      - name: Build
+        shell: cmd
+        # TODO: drop GGML_CUDA_CUB_3DOT2 once CCCL 3.2 ships in the CTK we use
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CPU_ALL_VARIANTS=ON ^
+            -DGGML_CUDA=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            -DGGML_CUDA_CUB_3DOT2=ON ^
+            ${{ env.CMAKE_ARGS }}
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS%
+
+      - name: Pack artifacts
+        shell: pwsh
+        run: |
+          $dst = ".\build\bin\Release"
+          Copy-Item LICENSE $dst\
+          # Bundle CUDA runtime next to the binaries (self-contained zip).
+          foreach ($pat in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll")) {
+            foreach ($src in @(
+              "${{ env.CUDA_PATH }}\bin",
+              "${{ env.CUDA_PATH }}\lib",
+              "${{ env.CUDA_PATH }}\bin\x64"
+            )) {
+              if (Test-Path $src) {
+                Copy-Item (Join-Path $src $pat) $dst -ErrorAction SilentlyContinue
+              }
+            }
+          }
+          7z a -snl llama-${{ needs.tag.outputs.name }}-bin-win-cuda-${{ matrix.cuda }}-x64.zip "$dst\*"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          path: llama-${{ needs.tag.outputs.name }}-bin-win-cuda-${{ matrix.cuda }}-x64.zip
+          name: llama-bin-win-cuda-${{ matrix.cuda }}-x64.zip
+
   release:
-    needs: [tag, macos, ubuntu-vulkan, windows-vulkan-x64, windows-cpu-arm64]
+    needs: [tag, macos, ubuntu-vulkan, windows-vulkan-x64, windows-cpu-arm64, windows-cuda-x64]
     if: ${{ github.ref_type == 'tag' || inputs.create_release }}
     permissions:
       contents: write
@@ -254,4 +319,4 @@ jobs:
             --repo "${{ github.repository }}" \
             --target "${{ github.sha }}" \
             --title "$TAG" \
-            --notes "llama-server builds for CanonicalDrafter (PremiseServer=ON; run with llama-server --premise; see tools/server/premise/)."
+            --notes "llama-server builds for CanonicalDrafter (PremiseServer=ON; run with llama-server --premise; see tools/server/premise/). Windows CUDA zips bundle cudart."

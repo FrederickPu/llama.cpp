@@ -7,7 +7,6 @@
 #include <faiss/index_io.h>
 
 #include <algorithm>
-#include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
@@ -197,13 +196,10 @@ struct PremiseIndex {
         return hits;
     }
 
-    void flush(bool ignore_throttle = false) {
+    // Write vecs/names when dirty. Called after every successful /cache.
+    void flush() {
         std::lock_guard<std::mutex> lock(mu);
         if (!dirty || vecs_path.empty() || names_path.empty()) {
-            return;
-        }
-        if (!ignore_throttle &&
-                std::chrono::steady_clock::now() - last_save < std::chrono::seconds(SAVE_SECONDS)) {
             return;
         }
 
@@ -224,12 +220,10 @@ struct PremiseIndex {
             return;
         }
         dirty = false;
-        last_save = std::chrono::steady_clock::now();
         fprintf(stderr, "premise cache: saved %zu rows\n", rows.size());
     }
 
 private:
-    static constexpr int SAVE_SECONDS = 60;
     inline static constexpr char NAMES_MAGIC[8] = {'P', 'M', 'N', 'A', 'M', 'E', '0', '1'};
 
     struct Row {
@@ -244,7 +238,6 @@ private:
     std::string vecs_path;
     std::string names_path;
     bool dirty = false;
-    std::chrono::steady_clock::time_point last_save{};
     mutable std::mutex mu;
 
     void clear(int model_dim) {
@@ -253,7 +246,6 @@ private:
         modules.clear();
         faiss = make_faiss(model_dim);
         dirty = false;
-        last_save = std::chrono::steady_clock::now();
     }
 
     // candidate_rows empty => full index; else FAISS top-k restricted to those labels.

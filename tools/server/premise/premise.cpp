@@ -180,7 +180,7 @@ void premise_cleanup() {
         return;
     }
     if (g_premise->index) {
-        g_premise->index->flush(true);
+        g_premise->index->flush();
     }
     if (g_premise->embed_ctx) {
         llama_free(g_premise->embed_ctx);
@@ -384,7 +384,7 @@ static json handle_cache(const json & body) {
     }
     auto candidates = embed_declarations(json_local_decls(body), module);
     g_premise->index->replace_module(module, token, json_string_array(body, "imports"), candidates);
-    g_premise->index->flush(false);
+    g_premise->index->flush();
     return json{{"ok", true}};
 }
 
