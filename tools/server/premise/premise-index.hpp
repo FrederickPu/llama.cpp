@@ -3,6 +3,7 @@
 #include "json.hpp"
 
 #include <faiss/IndexFlat.h>
+#include <faiss/IndexIDMap.h>
 #include <faiss/impl/IDSelector.h>
 #include <faiss/index_io.h>
 
@@ -11,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -20,11 +22,10 @@
 #include <utility>
 #include <vector>
 
-// rows[i] <-> FAISS label i. Embeddings live only in FAISS.
-// modules[m].row_ids = FAISS labels owned by module m.
-// Cache: --index-vecs (FAISS) + --index-names (PMNAME01); name order == FAISS order.
+// FAISS stores vectors in IndexFlatIP and exposes stable declaration IDs through
+// IndexIDMap2. modules[m].declaration_ids and rows use those stable IDs, never internal
+// IndexFlat offsets. Cache: --index-vecs (FAISS) + --index-names (PMNAME02).
 struct PremiseIndex {
-    // Inbound only (replace_module / local /select). Not stored long-term.
     struct Candidate {
         std::string name;
         std::string module;
@@ -40,10 +41,9 @@ struct PremiseIndex {
     struct ModuleEntry {
         std::string version_token;
         std::vector<std::string> imports;
-        std::vector<faiss::idx_t> row_ids;
+        std::vector<faiss::idx_t> declaration_ids;
     };
 
-    // Kept as IndexedDeclaration for existing call sites.
     using IndexedDeclaration = Candidate;
 
     size_t size() const {
@@ -102,20 +102,22 @@ struct PremiseIndex {
             faiss = make_faiss(dim);
         }
 
-        // Common path: new module -> append.
-        // Re-cache: module rows are one contiguous FAISS block (appended together);
-        // erase that [lo, hi) range (truncate if at end), then append replacements.
         auto existing = modules.find(module);
-        if (existing != modules.end() && !existing->second.row_ids.empty()) {
-            erase_contiguous_rows(existing->second.row_ids);
+        if (existing != modules.end() && !existing->second.declaration_ids.empty()) {
+            remove_ids(existing->second.declaration_ids);
         }
 
         ModuleEntry & entry = modules[module];
         entry.version_token = version_token;
         entry.imports = imports;
-        entry.row_ids.clear();
+        entry.declaration_ids.clear();
 
         std::unordered_set<std::string> seen;
+        std::vector<float> packed;
+        std::vector<faiss::idx_t> ids;
+        packed.reserve(replacements.size() * (size_t) std::max(dim, 0));
+        ids.reserve(replacements.size());
+
         for (const auto & c : replacements) {
             if (c.name.empty() || !seen.insert(c.name).second) {
                 continue;
@@ -123,13 +125,19 @@ struct PremiseIndex {
             if ((int) c.embedding.size() != dim) {
                 throw std::runtime_error("embedding dimension mismatch");
             }
-            if (faiss) {
-                faiss->add(1, c.embedding.data());
+            if (next_id == std::numeric_limits<faiss::idx_t>::max()) {
+                throw std::runtime_error("stable declaration ID space exhausted");
             }
-            entry.row_ids.push_back((faiss::idx_t) rows.size());
-            rows.push_back({c.name, module});
+            const faiss::idx_t id = next_id++;
+            ids.push_back(id);
+            packed.insert(packed.end(), c.embedding.begin(), c.embedding.end());
+            entry.declaration_ids.push_back(id);
+            rows.emplace(id, Row{c.name, module});
         }
 
+        if (!ids.empty()) {
+            faiss->add_with_ids((faiss::idx_t) ids.size(), packed.data(), ids.data());
+        }
         if (!vecs_path.empty() && !names_path.empty()) {
             dirty = true;
         }
@@ -140,9 +148,6 @@ struct PremiseIndex {
         return search_faiss(query, top_k, {});
     }
 
-    // Large set: FAISS top-k among import-closure candidate_rows.
-    // Small set: score request-local candidates in place (never inserted into FAISS).
-    // Then merge and keep overall top-k.
     std::vector<Hit> search_scoped(const float * query,
                                    const std::vector<std::string> & import_roots,
                                    const std::vector<Candidate> & locals,
@@ -159,7 +164,11 @@ struct PremiseIndex {
             collect_candidate_rows(root, visited, taken_names, candidate_rows);
         }
 
-        std::vector<Hit> hits = search_faiss(query, top_k, candidate_rows);
+        // Empty scoped closure means no indexed candidates, not global search.
+        std::vector<Hit> hits;
+        if (!candidate_rows.empty()) {
+            hits = search_faiss(query, top_k, candidate_rows);
+        }
 
         for (const auto & local : locals) {
             if (local.name.empty() || !taken_names.insert(local.name).second) {
@@ -185,7 +194,8 @@ struct PremiseIndex {
         return hits;
     }
 
-    // Write vecs/names when dirty. Called after every successful /cache.
+    // Persist after every successful /cache. The FAISS ID map is written
+    // directly; no second in-memory vector index is built.
     void flush() {
         std::lock_guard<std::mutex> lock(mu);
         if (!dirty || vecs_path.empty() || names_path.empty()) {
@@ -213,7 +223,7 @@ struct PremiseIndex {
     }
 
 private:
-    inline static constexpr char NAMES_MAGIC[8] = {'P', 'M', 'N', 'A', 'M', 'E', '0', '1'};
+    inline static constexpr char NAMES_MAGIC[8] = {'P', 'M', 'N', 'A', 'M', 'E', '0', '4'};
 
     struct Row {
         std::string name;
@@ -221,9 +231,10 @@ private:
     };
 
     int dim = 0;
-    std::vector<Row> rows;
+    faiss::idx_t next_id = 0;
+    std::unordered_map<faiss::idx_t, Row> rows;
     std::unordered_map<std::string, ModuleEntry> modules;
-    std::unique_ptr<faiss::IndexFlat> faiss;
+    std::unique_ptr<faiss::IndexIDMap2> faiss;
     std::string vecs_path;
     std::string names_path;
     bool dirty = false;
@@ -231,60 +242,23 @@ private:
 
     void clear(int model_dim) {
         dim = model_dim;
+        next_id = 0;
         rows.clear();
         modules.clear();
         faiss = make_faiss(model_dim);
         dirty = false;
     }
 
-    // Erase a contiguous label range [lo, hi) owned by one module (append order).
-    // Truncates if the block is a suffix; otherwise slides the tail down.
-    // Caller holds mu. Updates every module's row_ids.
-    void erase_contiguous_rows(const std::vector<faiss::idx_t> & row_ids) {
-        if (row_ids.empty()) {
-            return;
+    void remove_ids(const std::vector<faiss::idx_t> & ids) {
+        faiss::IDSelectorBatch remove(ids.size(), ids.data());
+        if (faiss && faiss->remove_ids(remove) != ids.size()) {
+            throw std::runtime_error("failed to remove module IDs from FAISS");
         }
-        faiss::idx_t lo = row_ids.front();
-        faiss::idx_t hi = row_ids.back() + 1;
-        // Require dense contiguous block matching row_ids.
-        if (hi - lo != (faiss::idx_t) row_ids.size()) {
-            throw std::runtime_error("module row_ids are not a contiguous block");
-        }
-        for (size_t i = 0; i < row_ids.size(); ++i) {
-            if (row_ids[i] != lo + (faiss::idx_t) i) {
-                throw std::runtime_error("module row_ids are not sorted-contiguous");
-            }
-        }
-        if (lo < 0 || hi > (faiss::idx_t) rows.size()) {
-            throw std::runtime_error("module row_ids out of range");
-        }
-
-        const faiss::idx_t n_drop = hi - lo;
-
-        if (faiss && n_drop > 0) {
-            faiss::IDSelectorRange remove(lo, hi);
-            if (faiss->remove_ids(remove) != (size_t) n_drop) {
-                throw std::runtime_error("failed to remove module rows from FAISS");
-            }
-        }
-
-        rows.erase(rows.begin() + (std::ptrdiff_t) lo, rows.begin() + (std::ptrdiff_t) hi);
-
-        // Shift labels after the hole.
-        for (auto & item : modules) {
-            std::vector<faiss::idx_t> kept;
-            kept.reserve(item.second.row_ids.size());
-            for (faiss::idx_t r : item.second.row_ids) {
-                if (r >= lo && r < hi) {
-                    continue; // dropped module (or overlap)
-                }
-                kept.push_back(r >= hi ? r - n_drop : r);
-            }
-            item.second.row_ids = std::move(kept);
+        for (faiss::idx_t id : ids) {
+            rows.erase(id);
         }
     }
 
-    // candidate_rows empty => full index; else FAISS top-k restricted to those labels.
     std::vector<Hit> search_faiss(const float * query, int top_k,
                                   const std::vector<faiss::idx_t> & candidate_rows) const {
         if (!faiss || top_k <= 0 || rows.empty()) {
@@ -302,6 +276,7 @@ private:
         std::vector<float> scores((size_t) n);
         std::vector<faiss::idx_t> labels((size_t) n);
         if (restricted) {
+            // IndexIDMap translates this external-ID selector for IndexFlat.
             faiss::IDSelectorBatch allow(candidate_rows.size(), candidate_rows.data());
             faiss::SearchParameters params;
             params.sel = &allow;
@@ -313,11 +288,11 @@ private:
         std::vector<Hit> out;
         out.reserve((size_t) n);
         for (int i = 0; i < n; ++i) {
-            const faiss::idx_t r = labels[(size_t) i];
-            if (r < 0 || r >= (faiss::idx_t) rows.size()) {
+            auto row = rows.find(labels[(size_t) i]);
+            if (row == rows.end()) {
                 continue;
             }
-            out.push_back({rows[(size_t) r].name, rows[(size_t) r].module, scores[(size_t) i]});
+            out.push_back({row->second.name, row->second.module, scores[(size_t) i]});
         }
         return out;
     }
@@ -336,16 +311,15 @@ private:
         for (const auto & imp : it->second.imports) {
             collect_candidate_rows(imp, visited, taken_names, candidate_rows);
         }
-        for (faiss::idx_t r : it->second.row_ids) {
-            const auto & name = rows[(size_t) r].name;
-            if (!name.empty() && taken_names.insert(name).second) {
-                candidate_rows.push_back(r);
+        for (faiss::idx_t id : it->second.declaration_ids) {
+            auto row = rows.find(id);
+            if (row != rows.end() && !row->second.name.empty() &&
+                    taken_names.insert(row->second.name).second) {
+                candidate_rows.push_back(id);
             }
         }
     }
 
-    // names file: PMNAME01 | modules{ name, version, imports[], decl_names[] }
-    // flattened decl_names order == FAISS row order
     void load_pair(std::istream & names_in, const std::string & vecs_file, int model_dim) {
         char magic[8] = {};
         names_in.read(magic, 8);
@@ -353,9 +327,16 @@ private:
             throw std::runtime_error("bad names magic");
         }
 
+        read_i64(names_in, next_id);
+        if (next_id < 0) {
+            throw std::runtime_error("invalid next declaration ID");
+        }
+
         uint32_t n_modules = 0;
         read_u32(names_in, n_modules);
-        std::unordered_set<std::string> seen;
+        std::unordered_set<std::string> seen_names;
+        std::unordered_set<faiss::idx_t> seen_ids;
+
         for (uint32_t i = 0; i < n_modules; ++i) {
             std::string mod, ver;
             read_str(names_in, mod);
@@ -372,40 +353,45 @@ private:
             uint32_t n_decls = 0;
             read_u32(names_in, n_decls);
             for (uint32_t j = 0; j < n_decls; ++j) {
+                faiss::idx_t id = 0;
+                read_i64(names_in, id);
                 std::string name;
                 read_str(names_in, name);
-                if (name.empty() || !seen.insert(mod + "\n" + name).second) {
+                if (id < 0 || id >= next_id || name.empty() || !seen_ids.insert(id).second ||
+                        !seen_names.insert(mod + "\n" + name).second) {
                     throw std::runtime_error("invalid declaration identity");
                 }
-                entry.row_ids.push_back((faiss::idx_t) rows.size());
-                rows.push_back({std::move(name), mod});
+                entry.declaration_ids.push_back(id);
+                rows.emplace(id, Row{std::move(name), mod});
             }
             modules[std::move(mod)] = std::move(entry);
         }
 
-        auto index = read_faiss(vecs_file.c_str());
-        if ((int) index->d != model_dim || (size_t) index->ntotal != rows.size()) {
+        faiss = read_id_map(vecs_file.c_str());
+        if ((int) faiss->d != model_dim || (size_t) faiss->ntotal != rows.size()) {
             throw std::runtime_error("vecs/names size mismatch");
         }
+        if (faiss->id_map.size() != rows.size()) {
+            throw std::runtime_error("FAISS ID map size mismatch");
+        }
+        for (faiss::idx_t id : faiss->id_map) {
+            if (rows.find(id) == rows.end()) {
+                throw std::runtime_error("FAISS contains unknown declaration ID");
+            }
+        }
+        faiss->construct_rev_map();
         dim = model_dim;
-        faiss = std::move(index);
     }
 
     void save_pair(const std::string & vecs_tmp, const std::string & names_tmp) const {
-        auto out = make_faiss(dim);
         std::ofstream names(names_tmp, std::ios::binary | std::ios::trunc);
-        if (!names || !out) {
+        if (!names || !faiss) {
             throw std::runtime_error("cannot open cache temps");
         }
 
-        // On-disk FAISS order = concatenation of each module's row_ids.
-        // Copy vectors via get_xb() (no per-row reconstruct) then one bulk add.
         names.write(NAMES_MAGIC, 8);
+        write_i64(names, next_id);
         write_u32(names, (uint32_t) modules.size());
-        std::vector<float> packed;
-        packed.reserve(rows.size() * (size_t) std::max(dim, 0));
-        const float * xb = (faiss && dim > 0) ? faiss->get_xb() : nullptr;
-
         for (const auto & item : modules) {
             write_str(names, item.first);
             write_str(names, item.second.version_token);
@@ -413,61 +399,83 @@ private:
             for (const auto & imp : item.second.imports) {
                 write_str(names, imp);
             }
-            write_u32(names, (uint32_t) item.second.row_ids.size());
-            for (faiss::idx_t r : item.second.row_ids) {
-                write_str(names, rows[(size_t) r].name);
-                if (xb) {
-                    const float * v = xb + (size_t) r * (size_t) dim;
-                    packed.insert(packed.end(), v, v + dim);
+            write_u32(names, (uint32_t) item.second.declaration_ids.size());
+            for (faiss::idx_t id : item.second.declaration_ids) {
+                auto row = rows.find(id);
+                if (row == rows.end()) {
+                    throw std::runtime_error("module references unknown declaration ID");
                 }
+                write_i64(names, id);
+                write_str(names, row->second.name);
             }
         }
         names.close();
         if (!names) {
             throw std::runtime_error("cannot finish names file");
         }
-        if (!packed.empty()) {
-            out->add((faiss::idx_t) (packed.size() / (size_t) dim), packed.data());
+        faiss::write_index(faiss.get(), vecs_tmp.c_str());
+    }
+
+    static std::unique_ptr<faiss::IndexIDMap2> make_faiss(int d) {
+        if (d <= 0) {
+            return nullptr;
         }
-        faiss::write_index(out.get(), vecs_tmp.c_str());
+        auto out = std::make_unique<faiss::IndexIDMap2>(new faiss::IndexFlatIP(d));
+        out->own_fields = true;
+        return out;
     }
 
-    static std::unique_ptr<faiss::IndexFlat> make_faiss(int d) {
-        return d > 0 ? std::make_unique<faiss::IndexFlatIP>(d) : nullptr;
-    }
-
-    static std::unique_ptr<faiss::IndexFlat> read_faiss(const char * path) {
+    static std::unique_ptr<faiss::IndexIDMap2> read_id_map(const char * path) {
         std::unique_ptr<faiss::Index> idx(faiss::read_index(path));
-        auto * flat = dynamic_cast<faiss::IndexFlat *>(idx.get());
-        if (!flat || flat->metric_type != faiss::METRIC_INNER_PRODUCT) {
-            throw std::runtime_error(std::string("expected IndexFlatIP: ") + path);
+        auto * map = dynamic_cast<faiss::IndexIDMap2 *>(idx.get());
+        if (!map || map->metric_type != faiss::METRIC_INNER_PRODUCT) {
+            throw std::runtime_error(std::string("expected IndexIDMap2(IndexFlatIP): ") + path);
+        }
+        if (!dynamic_cast<faiss::IndexFlat *>(map->index)) {
+            throw std::runtime_error(std::string("expected flat ID map storage: ") + path);
         }
         idx.release();
-        return std::unique_ptr<faiss::IndexFlat>(flat);
+        return std::unique_ptr<faiss::IndexIDMap2>(map);
     }
 
-    static void read_u32(std::istream & in, uint32_t & v) {
-        in.read(reinterpret_cast<char *>(&v), 4);
+    static void read_u32(std::istream & in, uint32_t & value) {
+        in.read(reinterpret_cast<char *>(&value), sizeof(value));
         if (!in) {
             throw std::runtime_error("truncated u32");
         }
     }
-    static void write_u32(std::ostream & out, uint32_t v) {
-        out.write(reinterpret_cast<const char *>(&v), 4);
+
+    static void write_u32(std::ostream & out, uint32_t value) {
+        out.write(reinterpret_cast<const char *>(&value), sizeof(value));
     }
-    static void read_str(std::istream & in, std::string & s) {
+
+    static void read_i64(std::istream & in, faiss::idx_t & value) {
+        static_assert(sizeof(faiss::idx_t) == sizeof(int64_t));
+        in.read(reinterpret_cast<char *>(&value), sizeof(value));
+        if (!in) {
+            throw std::runtime_error("truncated i64");
+        }
+    }
+
+    static void write_i64(std::ostream & out, faiss::idx_t value) {
+        static_assert(sizeof(faiss::idx_t) == sizeof(int64_t));
+        out.write(reinterpret_cast<const char *>(&value), sizeof(value));
+    }
+
+    static void read_str(std::istream & in, std::string & value) {
         uint32_t n = 0;
         read_u32(in, n);
-        s.resize(n);
+        value.resize(n);
         if (n) {
-            in.read(s.data(), n);
+            in.read(value.data(), n);
         }
         if (!in) {
             throw std::runtime_error("truncated string");
         }
     }
-    static void write_str(std::ostream & out, const std::string & s) {
-        write_u32(out, (uint32_t) s.size());
-        out.write(s.data(), (std::streamsize) s.size());
+
+    static void write_str(std::ostream & out, const std::string & value) {
+        write_u32(out, (uint32_t) value.size());
+        out.write(value.data(), (std::streamsize) value.size());
     }
 };
