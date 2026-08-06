@@ -61,6 +61,11 @@ DEMO_DECLARATIONS = [
     {"name": "Demo.add_zero", "decl": "theorem add_zero (n : Nat) : n + 0 = n"},
 ]
 DEMO_GOAL = "|- n + 0 = n"
+TAIL_MODULE = "Demo.Tail"
+TAIL_TOKEN = "premise-server-tail-v1"
+TAIL_DECLARATION = {"name": "Demo.tail", "decl": "theorem tail : True"}
+REFRESH_TOKEN = "premise-server-demo-v2"
+REFRESH_DECLARATION = {"name": "Demo.replacement", "decl": "theorem replacement : True"}
 
 
 def die(message: str) -> None:
@@ -263,6 +268,40 @@ def run_tests(args: argparse.Namespace) -> bool:
     suggestions = post_json("/select", select_body())
     if len(suggestions) != 2 or not all("name" in item and "score" in item for item in suggestions):
         print(f"[FAIL] /select returned malformed suggestions: {suggestions!r}", file=sys.stderr)
+        return False
+
+    print("5. Appending a second module, then re-caching the first", flush=True)
+    if post_json("/cache", {
+        "module": TAIL_MODULE,
+        "token": TAIL_TOKEN,
+        "imports": [],
+        "declarations": [TAIL_DECLARATION],
+    }) != {"ok": True}:
+        print("[FAIL] could not cache tail module", file=sys.stderr)
+        return False
+    if post_json("/cache", {
+        "module": DEMO_MODULE,
+        "token": REFRESH_TOKEN,
+        "imports": [],
+        "declarations": [REFRESH_DECLARATION],
+    }) != {"ok": True}:
+        print("[FAIL] could not refresh first module", file=sys.stderr)
+        return False
+
+    refreshed = post_json("/select", {
+        "imports": [DEMO_MODULE], "declarations": [], "goal": "|- True", "k": 8,
+    })
+    tail = post_json("/select", {
+        "imports": [TAIL_MODULE], "declarations": [], "goal": "|- True", "k": 8,
+    })
+    if [item["name"] for item in refreshed] != [REFRESH_DECLARATION["name"]]:
+        print(f"[FAIL] refreshed module still has stale rows: {refreshed!r}", file=sys.stderr)
+        return False
+    if [item["name"] for item in tail] != [TAIL_DECLARATION["name"]]:
+        print(f"[FAIL] downstream labels shifted incorrectly: {tail!r}", file=sys.stderr)
+        return False
+    if post_json("/version", {"module": TAIL_MODULE}) != TAIL_TOKEN:
+        print("[FAIL] tail module token changed during first-module refresh", file=sys.stderr)
         return False
 
     print("premise mode demo OK. Suggestions:", flush=True)

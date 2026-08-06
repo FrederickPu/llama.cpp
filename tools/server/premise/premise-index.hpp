@@ -48,7 +48,7 @@ struct PremiseIndex {
 
     size_t size() const {
         std::lock_guard<std::mutex> lock(mu);
-        return rows.size() - n_tombstones;
+        return rows.size();
     }
 
     int embedding_dim() const {
@@ -102,12 +102,12 @@ struct PremiseIndex {
             faiss = make_faiss(dim);
         }
 
-        // Common path: new module -> append. Re-cache: tombstone old rows (FAISS
-        // IndexFlat cannot delete in place), then append replacements. Compact
-        // only when tombstones get large, or on save (save skips dead rows).
+        // Common path: new module -> append.
+        // Re-cache: module rows are one contiguous FAISS block (appended together);
+        // erase that [lo, hi) range (truncate if at end), then append replacements.
         auto existing = modules.find(module);
         if (existing != modules.end() && !existing->second.row_ids.empty()) {
-            tombstone_module(module);
+            erase_contiguous_rows(existing->second.row_ids);
         }
 
         ModuleEntry & entry = modules[module];
@@ -128,10 +128,6 @@ struct PremiseIndex {
             }
             entry.row_ids.push_back((faiss::idx_t) rows.size());
             rows.push_back({c.name, module});
-        }
-
-        if (n_tombstones > 0 && n_tombstones * 4 > rows.size()) {
-            compact();
         }
 
         if (!vecs_path.empty() && !names_path.empty()) {
@@ -231,7 +227,6 @@ private:
     std::string vecs_path;
     std::string names_path;
     bool dirty = false;
-    size_t n_tombstones = 0;
     mutable std::mutex mu;
 
     void clear(int model_dim) {
@@ -240,84 +235,69 @@ private:
         modules.clear();
         faiss = make_faiss(model_dim);
         dirty = false;
-        n_tombstones = 0;
     }
 
-    // Mark module rows dead without touching FAISS (IndexFlat is append-only).
-    // Caller holds mu. O(|rows of module|).
-    void tombstone_module(const std::string & module) {
-        auto it = modules.find(module);
-        if (it == modules.end()) {
+    // Erase a contiguous label range [lo, hi) owned by one module (append order).
+    // Truncates if the block is a suffix; otherwise slides the tail down.
+    // Caller holds mu. Updates every module's row_ids.
+    void erase_contiguous_rows(const std::vector<faiss::idx_t> & row_ids) {
+        if (row_ids.empty()) {
             return;
         }
-        for (faiss::idx_t r : it->second.row_ids) {
-            if (r >= 0 && r < (faiss::idx_t) rows.size() && !rows[(size_t) r].name.empty()) {
-                rows[(size_t) r].name.clear();
-                rows[(size_t) r].module.clear();
-                ++n_tombstones;
+        faiss::idx_t lo = row_ids.front();
+        faiss::idx_t hi = row_ids.back() + 1;
+        // Require dense contiguous block matching row_ids.
+        if (hi - lo != (faiss::idx_t) row_ids.size()) {
+            throw std::runtime_error("module row_ids are not a contiguous block");
+        }
+        for (size_t i = 0; i < row_ids.size(); ++i) {
+            if (row_ids[i] != lo + (faiss::idx_t) i) {
+                throw std::runtime_error("module row_ids are not sorted-contiguous");
             }
         }
-        it->second.row_ids.clear();
-    }
-
-    // Physically drop tombstones and rewrite FAISS labels. Caller holds mu.
-    void compact() {
-        if (n_tombstones == 0) {
-            return;
-        }
-        auto next_faiss = make_faiss(dim);
-        std::vector<Row> next_rows;
-        next_rows.reserve(rows.size() - n_tombstones);
-        std::unordered_map<std::string, ModuleEntry> next_modules;
-
-        for (const auto & item : modules) {
-            next_modules[item.first] = {item.second.version_token, item.second.imports, {}};
+        if (lo < 0 || hi > (faiss::idx_t) rows.size()) {
+            throw std::runtime_error("module row_ids out of range");
         }
 
-        const float * xb = (faiss && dim > 0) ? faiss->get_xb() : nullptr;
-        std::vector<float> packed;
-        packed.reserve((rows.size() - n_tombstones) * (size_t) std::max(dim, 0));
+        const faiss::idx_t n_drop = hi - lo;
 
-        for (faiss::idx_t r = 0; r < (faiss::idx_t) rows.size(); ++r) {
-            if (rows[(size_t) r].name.empty()) {
-                continue;
+        if (faiss && n_drop > 0) {
+            faiss::IDSelectorRange remove(lo, hi);
+            if (faiss->remove_ids(remove) != (size_t) n_drop) {
+                throw std::runtime_error("failed to remove module rows from FAISS");
             }
-            if (xb) {
-                const float * v = xb + (size_t) r * (size_t) dim;
-                packed.insert(packed.end(), v, v + dim);
+        }
+
+        rows.erase(rows.begin() + (std::ptrdiff_t) lo, rows.begin() + (std::ptrdiff_t) hi);
+
+        // Shift labels after the hole.
+        for (auto & item : modules) {
+            std::vector<faiss::idx_t> kept;
+            kept.reserve(item.second.row_ids.size());
+            for (faiss::idx_t r : item.second.row_ids) {
+                if (r >= lo && r < hi) {
+                    continue; // dropped module (or overlap)
+                }
+                kept.push_back(r >= hi ? r - n_drop : r);
             }
-            const std::string & mod = rows[(size_t) r].module;
-            next_modules[mod].row_ids.push_back((faiss::idx_t) next_rows.size());
-            next_rows.push_back(rows[(size_t) r]);
+            item.second.row_ids = std::move(kept);
         }
-        if (!packed.empty()) {
-            next_faiss->add((faiss::idx_t) (packed.size() / (size_t) dim), packed.data());
-        }
-        rows = std::move(next_rows);
-        modules = std::move(next_modules);
-        faiss = std::move(next_faiss);
-        n_tombstones = 0;
     }
 
     // candidate_rows empty => full index; else FAISS top-k restricted to those labels.
     std::vector<Hit> search_faiss(const float * query, int top_k,
                                   const std::vector<faiss::idx_t> & candidate_rows) const {
-        if (!faiss || top_k <= 0 || rows.size() <= n_tombstones) {
+        if (!faiss || top_k <= 0 || rows.empty()) {
             return {};
         }
 
         const bool restricted = !candidate_rows.empty();
-        // Over-fetch when tombstones exist so filtering still yields top_k live hits.
-        const int live = (int) (rows.size() - n_tombstones);
-        const int want = restricted
+        const int n = restricted
             ? std::min(top_k, (int) candidate_rows.size())
-            : std::min(top_k, live);
-        if (want <= 0) {
+            : std::min(top_k, (int) rows.size());
+        if (n <= 0) {
             return {};
         }
-        const int n = restricted
-            ? want
-            : std::min((int) rows.size(), want + (int) n_tombstones);
 
         std::vector<float> scores((size_t) n);
         std::vector<faiss::idx_t> labels((size_t) n);
@@ -331,14 +311,11 @@ private:
         }
 
         std::vector<Hit> out;
-        out.reserve((size_t) want);
-        for (int i = 0; i < n && (int) out.size() < want; ++i) {
+        out.reserve((size_t) n);
+        for (int i = 0; i < n; ++i) {
             const faiss::idx_t r = labels[(size_t) i];
             if (r < 0 || r >= (faiss::idx_t) rows.size()) {
                 continue;
-            }
-            if (rows[(size_t) r].name.empty()) {
-                continue; // tombstone
             }
             out.push_back({rows[(size_t) r].name, rows[(size_t) r].module, scores[(size_t) i]});
         }
