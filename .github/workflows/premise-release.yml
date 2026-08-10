@@ -93,6 +93,7 @@ jobs:
       - name: Pack artifacts
         run: |
           cp LICENSE ./build/bin/
+          cp vendor/sqlite/SQLITE-PUBLIC-DOMAIN.txt ./build/bin/NOTICE-SQLite
           tar -czvf llama-${{ needs.tag.outputs.name }}-bin-macos-${{ matrix.build }}.tar.gz -s ",^\.,llama-${{ needs.tag.outputs.name }}," -C ./build/bin .
 
       - name: Upload artifacts
@@ -144,10 +145,13 @@ jobs:
             -DGGML_VULKAN=ON \
             ${{ env.CMAKE_ARGS }}
           cmake --build build --config Release -j $(nproc)
+          cmake --build build --config Release --target test-premise-index -j $(nproc)
+          ./build/bin/test-premise-index
 
       - name: Pack artifacts
         run: |
           cp LICENSE ./build/bin/
+          cp vendor/sqlite/SQLITE-PUBLIC-DOMAIN.txt ./build/bin/NOTICE-SQLite
           tar -czvf llama-${{ needs.tag.outputs.name }}-bin-ubuntu-vulkan-${{ matrix.build }}.tar.gz --transform "s,^\.,llama-${{ needs.tag.outputs.name }}," -C ./build/bin .
 
       - name: Upload artifacts
@@ -185,6 +189,7 @@ jobs:
       - name: Pack artifacts
         run: |
           Copy-Item LICENSE .\build\bin\Release\
+          Copy-Item vendor\sqlite\SQLITE-PUBLIC-DOMAIN.txt .\build\bin\Release\NOTICE-SQLite
           7z a -snl llama-${{ needs.tag.outputs.name }}-bin-win-vulkan-x64.zip .\build\bin\Release\*
 
       - name: Upload artifacts
@@ -223,6 +228,7 @@ jobs:
       - name: Pack artifacts
         run: |
           Copy-Item LICENSE .\build\bin\Release\
+          Copy-Item vendor\sqlite\SQLITE-PUBLIC-DOMAIN.txt .\build\bin\Release\NOTICE-SQLite
           7z a -snl llama-${{ needs.tag.outputs.name }}-bin-win-cpu-arm64.zip .\build\bin\Release\*
 
       - name: Upload artifacts
@@ -277,6 +283,7 @@ jobs:
         run: |
           $dst = ".\build\bin\Release"
           Copy-Item LICENSE $dst\
+          Copy-Item vendor\sqlite\SQLITE-PUBLIC-DOMAIN.txt $dst\NOTICE-SQLite
           # Bundle CUDA runtime next to the binaries (self-contained zip).
           foreach ($pat in @("cudart64_*.dll", "cublas64_*.dll", "cublasLt64_*.dll")) {
             foreach ($src in @(

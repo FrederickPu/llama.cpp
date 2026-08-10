@@ -123,16 +123,10 @@ static json hits_to_json(const std::vector<PremiseIndex::Hit> & hits) {
 // Setup / cleanup
 // ---------------------------------------------------------------------------
 
-void premise_setup(server_context & ctx_server,
-                   const std::string & vecs_path,
-                   const std::string & names_path) {
-    if (vecs_path.empty() != names_path.empty()) {
-        SRV_WRN("%s", "--index-vecs and --index-names must both be set\n");
-    }
-
+bool premise_setup(server_context & ctx_server, const std::string & database_path) {
     auto * server_ctx = ctx_server.get_llama_context();
     if (!server_ctx) {
-        return;
+        return false;
     }
 
     llama_model * model = const_cast<llama_model *>(llama_get_model(server_ctx));
@@ -153,17 +147,13 @@ void premise_setup(server_context & ctx_server,
     llama_context * embed_ctx = llama_init_from_model(model, embed_params);
     if (!embed_ctx) {
         SRV_ERR("%s", "failed to create embedding context\n");
-        return;
+        return false;
     }
 
     try {
         const int embed_dim = llama_model_n_embd_out(model);
         auto index = std::make_unique<PremiseIndex>();
-        if (!vecs_path.empty() && !names_path.empty()) {
-            index->load_cache(vecs_path, names_path, embed_dim);
-        } else {
-            index->initialize_empty(embed_dim);
-        }
+        index->open(database_path, embed_dim);
 
         auto state = std::make_unique<PremiseState>();
         state->embed_ctx = embed_ctx;
@@ -172,18 +162,17 @@ void premise_setup(server_context & ctx_server,
         g_premise = state.release();
 
         SRV_INF("premise ready: rows=%d\n", (int) g_premise->index->size());
+        return true;
     } catch (const std::exception & e) {
         SRV_ERR("premise init failed: %s\n", e.what());
         llama_free(embed_ctx);
+        return false;
     }
 }
 
 void premise_cleanup() {
     if (!g_premise) {
         return;
-    }
-    if (g_premise->index) {
-        g_premise->index->flush();
     }
     if (g_premise->embed_ctx) {
         llama_free(g_premise->embed_ctx);
@@ -388,7 +377,6 @@ static json handle_cache(const json & body) {
     }
     auto candidates = embed_declarations(json_local_decls(body), module);
     g_premise->index->replace_module(module, token, json_string_array(body, "imports"), candidates);
-    g_premise->index->flush();
     return json{{"ok", true}};
 }
 
@@ -434,10 +422,8 @@ static void print_premise_usage(int, char **) {
     printf("\n\n----- premise mode (llama-server --premise) -----\n\n");
     printf("  --premise\n");
     printf("      run as premise retrieval server instead of generation server\n\n");
-    printf("  --index-vecs FILE\n");
-    printf("      path to the FAISS premise index\n\n");
-    printf("  --index-names FILE, --index-strings FILE\n");
-    printf("      path to module/name side of the cache (aligned with --index-vecs)\n\n");
+    printf("  --index-db FILE\n");
+    printf("      path to the SQLite premise database\n\n");
 }
 
 static void premise_signal_handler(int signal) {
@@ -459,18 +445,15 @@ static server_http_res_ptr health_ok(const server_http_req &) {
 int premise_server(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
-    std::string vecs_path;
-    std::string names_path;
+    std::string database_path;
     std::vector<char *> args;
     args.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--premise") {
             // Mode flag consumed by main dispatcher / this entry point.
-        } else if (a == "--index-vecs" && i + 1 < argc) {
-            vecs_path = argv[++i];
-        } else if ((a == "--index-names" || a == "--index-strings") && i + 1 < argc) {
-            names_path = argv[++i];
+        } else if (a == "--index-db" && i + 1 < argc) {
+            database_path = argv[++i];
         } else {
             args.push_back(argv[i]);
         }
@@ -481,6 +464,10 @@ int premise_server(int argc, char ** argv) {
     common_params params;
     common_init();
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER, print_premise_usage)) {
+        return 1;
+    }
+    if (database_path.empty()) {
+        SRV_ERR("%s", "--index-db is required in premise mode\n");
         return 1;
     }
 
@@ -530,7 +517,14 @@ int premise_server(int argc, char ** argv) {
         return 1;
     }
 
-    premise_setup(ctx_server, vecs_path, names_path);
+    if (!premise_setup(ctx_server, database_path)) {
+        clean_up();
+        if (ctx_http.thread.joinable()) {
+            ctx_http.thread.join();
+        }
+        SRV_ERR("%s", "exiting due to premise initialization error\n");
+        return 1;
+    }
     ctx_http.is_ready.store(true);
     SRV_INF("llama-server --premise listening on %s\n", ctx_http.listening_address.c_str());
 

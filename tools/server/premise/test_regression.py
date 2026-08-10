@@ -4,7 +4,7 @@ Demo and regression test for llama-server --premise.
 Premise mode is embedding-only retrieval used by CanonicalDrafter to rank Lean
 premises. It does not generate text. The intended flow is:
 
-  1. Start: llama-server --premise --model ... --index-vecs ... --index-names ...
+  1. Start: llama-server --premise --model ... --index-db ...
   2. Ask /version whether one Lean module is already cached.
   3. Send that module's declarations to /cache when the version token is missing or stale.
   4. Call /select with imports, local declarations, a goal, and k.
@@ -48,8 +48,7 @@ CMAKE_CONFIGURE_ARGS = [
 ]
 
 DEFAULT_MODEL = Path("D:/hparam_outputs/thomas-zhu-lean-premise.f16.gguf")
-DEFAULT_INDEX_VECS = BUILD_DIR / "premise-demo-vectors.bin"
-DEFAULT_INDEX_NAMES = BUILD_DIR / "premise-demo-names.bin"
+DEFAULT_INDEX_DB = BUILD_DIR / "premise-demo.db"
 THOMAS_ZHU_MODEL_ID = "l3lab/all-distilroberta-v1-lr2e-4-bs256-nneg3-ml-ne2"
 THOMAS_ZHU_MODEL_REVISION = "v4.30.0"
 
@@ -124,8 +123,7 @@ def premise_server_command(args: argparse.Namespace) -> list[str]:
         "--model", str(args.model),
         "--pooling", args.pooling,
         "--ctx-size", str(args.ctx_size),
-        "--index-vecs", str(args.index_vecs),
-        "--index-names", str(args.index_names),
+        "--index-db", str(args.index_db),
     ]
     command.extend(args.server_arg or [])
     return command
@@ -143,8 +141,7 @@ class ManagedPremiseServer:
                 f"Premise GGUF does not exist: {self.args.model}\n"
                 f"Expected Thomas Zhu model: {THOMAS_ZHU_MODEL_ID} revision {THOMAS_ZHU_MODEL_REVISION}"
             )
-        self.args.index_vecs.parent.mkdir(parents=True, exist_ok=True)
-        self.args.index_names.parent.mkdir(parents=True, exist_ok=True)
+        self.args.index_db.parent.mkdir(parents=True, exist_ok=True)
 
         env = os.environ.copy()
         if BUILD_BIN_DIR.exists():
@@ -339,16 +336,15 @@ Build
 Start
 -----
 
-The cache is a pair of files rewritten together on /cache:
-  --index-vecs  : FAISS IndexFlatIP embeddings
-  --index-names : module graph + declaration names in FAISS row order
+The cache is one embedded SQLite database containing module metadata and
+    ordinary float32 embedding BLOBs. A disposable .faiss sidecar accelerates startup:
+  --index-db : SQLite premise database
 Pretty-printed declaration strings are sent by Lean only to compute embeddings;
-they are not stored in either file.
+they are not stored in the database.
 
    {server_exe} --premise --host {args.host} --port {args.port} --model {args.model} {line_continue}
        --pooling {args.pooling} --ctx-size {args.ctx_size} {line_continue}
-       --index-vecs {args.index_vecs} {line_continue}
-       --index-names {args.index_names}
+       --index-db {args.index_db}
 
 API
 ---
@@ -399,9 +395,9 @@ API
 Notes
 -----
 
-  - /version is an in-memory module freshness check; it resets on restart.
-  - --index-vecs stores embeddings; --index-names stores module/name identity.
-    Both are updated together. Declaration strings are not persisted.
+  - /version reads module freshness metadata loaded from --index-db and survives restart.
+  - /cache replaces one module transactionally in the SQLite database.
+    Declaration strings are not persisted.
   - Lean decides which declarations belong to each module and sends fully
     qualified names through /cache; the server does not infer module membership.
   - /version and /cache are one module per request.
@@ -430,9 +426,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL, help="GGUF embedding model")
     parser.add_argument("--pooling", default="mean")
     parser.add_argument("--ctx-size", type=int, default=512)
-    parser.add_argument("--index-vecs", type=Path, default=DEFAULT_INDEX_VECS, help="Persistent embedding vector cache")
-    parser.add_argument("--index-names", dest="index_names", type=Path, default=DEFAULT_INDEX_NAMES, help="Module/name side of the persistent cache pair")
-    parser.add_argument("--index-strings", dest="index_names", type=Path, help="Deprecated alias for --index-names")
+    parser.add_argument("--index-db", type=Path, default=DEFAULT_INDEX_DB, help="SQLite premise database")
     parser.add_argument("--startup-timeout", type=int, default=180)
     parser.add_argument("--server-bin", type=Path, help="Path to llama-server executable")
     parser.add_argument("--server-log", type=Path)
