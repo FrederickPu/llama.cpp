@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <list>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -77,6 +78,33 @@ struct PremiseIndex {
         require_db();
         refresh_database_locked();
         return dim;
+    }
+
+    bool find_local_embedding(const std::string & text, std::vector<float> & embedding) {
+        std::lock_guard<std::mutex> lock(local_cache_mu);
+        auto found = local_cache_index.find(text);
+        if (found == local_cache_index.end()) {
+            return false;
+        }
+        local_cache.splice(local_cache.begin(), local_cache, found->second);
+        embedding = found->second->second;
+        return true;
+    }
+
+    void cache_local_embedding(const std::string & text, const std::vector<float> & embedding) {
+        std::lock_guard<std::mutex> lock(local_cache_mu);
+        auto found = local_cache_index.find(text);
+        if (found != local_cache_index.end()) {
+            local_cache.splice(local_cache.begin(), local_cache, found->second);
+            found->second->second = embedding;
+            return;
+        }
+        local_cache.emplace_front(text, embedding);
+        local_cache_index.emplace(local_cache.front().first, local_cache.begin());
+        if (local_cache.size() > LOCAL_CACHE_CAPACITY) {
+            local_cache_index.erase(local_cache.back().first);
+            local_cache.pop_back();
+        }
     }
 
     void open(const std::string & path, int model_dim, size_t rebuild_threshold = 1024) {
@@ -263,16 +291,22 @@ struct PremiseIndex {
         }
         validate_vector(query, dim, "query embedding");
 
-        std::vector<faiss::idx_t> eligible_ids;
-        std::unordered_set<std::string> taken_names;
-        std::unordered_set<std::string> visited;
-        for (const auto & root : import_roots) {
-            collect_candidate_rows(root, visited, taken_names, eligible_ids);
+        if (scope_cache.revision != content_revision || scope_cache.import_roots != import_roots) {
+            scope_cache = {};
+            scope_cache.revision = content_revision;
+            scope_cache.import_roots = import_roots;
+            std::unordered_set<std::string> visited;
+            for (const auto & root : import_roots) {
+                collect_candidate_rows(root, visited, scope_cache.names, scope_cache.ids);
+            }
+            if (!delta_ids.empty()) {
+                scope_cache.id_set.insert(scope_cache.ids.begin(), scope_cache.ids.end());
+            }
         }
-        const std::unordered_set<faiss::idx_t> eligible(eligible_ids.begin(), eligible_ids.end());
 
-        std::vector<Hit> hits = search_base(query, top_k, &eligible_ids);
-        score_exact(query, &eligible, locals, &taken_names, hits);
+        std::vector<Hit> hits = search_base(query, top_k, &scope_cache.ids);
+        score_exact(query, delta_ids.empty() ? nullptr : &scope_cache.id_set,
+                locals, &scope_cache.names, hits);
         trim_hits(hits, top_k);
         return hits;
     }
@@ -294,6 +328,9 @@ struct PremiseIndex {
     }
 
 private:
+    using LocalCache = std::list<std::pair<std::string, std::vector<float>>>;
+    static constexpr size_t LOCAL_CACHE_CAPACITY = 4096;
+
     struct Row {
         std::string name;
         std::string module;
@@ -314,6 +351,14 @@ private:
         std::array<uint8_t, 16> identity = {};
         int64_t revision = 0;
         bool loaded = false;
+    };
+
+    struct ScopeCache {
+        int64_t revision = -1;
+        std::vector<std::string> import_roots;
+        std::vector<faiss::idx_t> ids;
+        std::unordered_set<faiss::idx_t> id_set;
+        std::unordered_set<std::string> names;
     };
 
     struct Statement {
@@ -397,6 +442,10 @@ private:
     mutable std::unique_ptr<faiss::IndexIDMap2> base_index;
     mutable std::unordered_set<faiss::idx_t> base_ids;
     mutable std::unordered_set<faiss::idx_t> delta_ids;
+    mutable ScopeCache scope_cache;
+    std::mutex local_cache_mu;
+    LocalCache local_cache;
+    std::unordered_map<std::string, LocalCache::iterator> local_cache_index;
     mutable std::mutex mu;
     mutable std::condition_variable worker_cv;
     std::thread worker;
@@ -1218,7 +1267,7 @@ private:
             const float * query,
             const std::unordered_set<faiss::idx_t> * eligible_ids,
             const std::vector<Candidate> & locals,
-            std::unordered_set<std::string> * taken_names,
+            const std::unordered_set<std::string> * indexed_names,
             std::vector<Hit> & hits) const {
         for (faiss::idx_t id : delta_ids) {
             if (eligible_ids && eligible_ids->find(id) == eligible_ids->end()) {
@@ -1235,8 +1284,11 @@ private:
             hits.push_back({row->second.name, row->second.module, score});
         }
 
+        std::unordered_set<std::string> local_names;
         for (const auto & local : locals) {
-            if (local.name.empty() || (taken_names && !taken_names->insert(local.name).second)) {
+            if (local.name.empty() ||
+                    (indexed_names && indexed_names->find(local.name) != indexed_names->end()) ||
+                    !local_names.insert(local.name).second) {
                 continue;
             }
             validate_vector(local.embedding, dim, "local embedding");

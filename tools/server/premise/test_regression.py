@@ -65,6 +65,7 @@ TAIL_TOKEN = "premise-server-tail-v1"
 TAIL_DECLARATION = {"name": "Demo.tail", "decl": "theorem tail : True"}
 REFRESH_TOKEN = "premise-server-demo-v2"
 REFRESH_DECLARATION = {"name": "Demo.replacement", "decl": "theorem replacement : True"}
+LOCAL_DECLARATION = {"name": "Demo.local", "decl": "theorem local (n : Nat) : n + 0 = n"}
 
 
 def die(message: str) -> None:
@@ -176,7 +177,10 @@ class ManagedPremiseServer:
 
         while time.time() < deadline:
             if self.process and self.process.poll() is not None:
-                die(f"llama-server exited early with code {self.process.returncode}; see {self.log_file.name}")
+                log_name = self.log_file.name
+                self.log_file.close()
+                self.log_file = None
+                die(f"llama-server exited early with code {self.process.returncode}; see {log_name}")
             try:
                 with urllib.request.urlopen(health_url, timeout=2) as response:
                     if response.status == 200:
@@ -267,7 +271,21 @@ def run_tests(args: argparse.Namespace) -> bool:
         print(f"[FAIL] /select returned malformed suggestions: {suggestions!r}", file=sys.stderr)
         return False
 
-    print("5. Appending a second module, then re-caching the first", flush=True)
+    print("5. Reusing an unchanged local declaration embedding", flush=True)
+    local_request = {
+        "imports": [DEMO_MODULE], "declarations": [LOCAL_DECLARATION], "goal": DEMO_GOAL, "k": 3,
+    }
+    local_first = post_json("/select", local_request)
+    local_cached = post_json("/select", local_request)
+    local_changed = len(local_cached) != len(local_first) or any(
+        before["name"] != after["name"] or abs(before["score"] - after["score"]) > 1e-6
+        for before, after in zip(local_first, local_cached)
+    )
+    if local_changed:
+        print(f"[FAIL] cached local selection changed: {local_first!r} != {local_cached!r}", file=sys.stderr)
+        return False
+
+    print("6. Appending a second module, then re-caching the first", flush=True)
     if post_json("/cache", {
         "module": TAIL_MODULE,
         "token": TAIL_TOKEN,

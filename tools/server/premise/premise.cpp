@@ -305,18 +305,31 @@ static std::vector<std::vector<float>> embed_token_batch(
 
 static std::vector<PremiseIndex::Candidate> embed_declarations(
         const std::vector<LocalDecl> & decls,
-        const std::string & module) {
+        const std::string & module,
+        bool cache_by_body = false) {
     std::vector<std::vector<llama_token>> sequences;
     sequences.reserve(decls.size());
     std::vector<PremiseIndex::Candidate> out(decls.size());
+    std::vector<size_t> missing;
+    missing.reserve(decls.size());
     for (size_t i = 0; i < decls.size(); ++i) {
         out[i].name = decls[i].name;
         out[i].module = module;
+        if (cache_by_body &&
+                g_premise->index->find_local_embedding(decls[i].body, out[i].embedding)) {
+            continue;
+        }
+        missing.push_back(i);
         sequences.push_back(tokenize_for_embed(g_premise->embed_ctx, decls[i].body));
     }
     auto vectors = embed_token_batch(std::move(sequences));
-    for (size_t i = 0; i < out.size(); ++i) {
-        out[i].embedding = std::move(vectors[i]);
+    for (size_t i = 0; i < missing.size(); ++i) {
+        const size_t out_index = missing[i];
+        out[out_index].embedding = std::move(vectors[i]);
+        if (cache_by_body) {
+            g_premise->index->cache_local_embedding(
+                    decls[out_index].body, out[out_index].embedding);
+        }
     }
     return out;
 }
@@ -341,7 +354,7 @@ static std::vector<PremiseIndex::Hit> select_hits(
         return {};
     }
     if (params.use_scoped_search) {
-        auto locals = embed_declarations(params.local_decls, "");
+        auto locals = embed_declarations(params.local_decls, "", true);
         return g_premise->index->search_scoped(
                 query.data(), params.imports, locals, params.top_k);
     }

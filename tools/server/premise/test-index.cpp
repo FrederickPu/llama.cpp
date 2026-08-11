@@ -75,6 +75,17 @@ int main() {
             require(std::filesystem::exists(path.string() + ".faiss"),
                     "first open did not persist a FAISS sidecar");
             require(!index.loaded_sidecar_for_test(), "first open unexpectedly loaded a sidecar");
+            std::vector<float> local_embedding;
+            require(!index.find_local_embedding("local declaration", local_embedding),
+                    "unknown local embedding was cached");
+            index.cache_local_embedding("local declaration", {0.6f, 0.8f});
+            require(index.find_local_embedding("local declaration", local_embedding) &&
+                    local_embedding == std::vector<float>({0.6f, 0.8f}),
+                    "local embedding cache lookup failed");
+            index.cache_local_embedding("local declaration", {1.0f, 0.0f});
+            require(index.find_local_embedding("local declaration", local_embedding) &&
+                    local_embedding == std::vector<float>({1.0f, 0.0f}),
+                    "local embedding cache update failed");
             index.replace_module("A", "a1", {}, {
                 candidate("A.x", 1.0f, 0.0f),
                 candidate("A.y", 0.0f, 1.0f),
@@ -124,6 +135,9 @@ int main() {
             require(index.loaded_sidecar_for_test(), "second open did not load the FAISS sidecar");
             require(index.size() == 3, "rows did not survive database reopen");
             require(index.get_module_version("A") == "a2", "version did not survive database reopen");
+            std::vector<float> local_embedding;
+            require(!index.find_local_embedding("local declaration", local_embedding),
+                    "local embedding cache was serialized");
             auto global = index.search_global(query_y, 3);
             require(global.size() == 3 && has_hit(global, "A.x"), "sidecar startup results changed");
 
