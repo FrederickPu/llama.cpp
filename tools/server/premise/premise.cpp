@@ -12,6 +12,7 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <clocale>
 #include <csignal>
 #include <functional>
@@ -375,6 +376,13 @@ static json handle_version(const json & body) {
     return token.empty() ? json(nullptr) : json(token);
 }
 
+// milliseconds elapsed since `since`, as a double
+static double ms_since(const std::chrono::steady_clock::time_point & since) {
+    const std::chrono::duration<double, std::milli> elapsed =
+        std::chrono::steady_clock::now() - since;
+    return elapsed.count();
+}
+
 // /cache one module; declarations[] batch-embedded then replace_module
 static json handle_cache(const json & body) {
     if (!g_premise || !g_premise->index) {
@@ -386,11 +394,37 @@ static json handle_cache(const json & body) {
         throw std::runtime_error("missing module or token");
     }
     if (g_premise->index->get_module_version(module) == token) {
-        return json{{"ok", true}};
+        LOG_INF("%s: module '%s' already at token '%s', nothing to do\n",
+                __func__, module.c_str(), token.c_str());
+        return json{
+            {"ok", true},
+            {"cached", true},
+            {"n_declarations", 0},
+            {"embed_ms", 0.0},
+            {"replace_ms", 0.0},
+        };
     }
-    auto candidates = embed_declarations(json_local_decls(body), module);
+
+    const auto decls = json_local_decls(body);
+
+    const auto t_embed_start = std::chrono::steady_clock::now();
+    auto candidates = embed_declarations(decls, module);
+    const double embed_ms = ms_since(t_embed_start);
+
+    const auto t_replace_start = std::chrono::steady_clock::now();
     g_premise->index->replace_module(module, token, json_string_array(body, "imports"), candidates);
-    return json{{"ok", true}};
+    const double replace_ms = ms_since(t_replace_start);
+
+    LOG_INF("%s: module '%s': %zu decls, embed %.2f ms, replace_module %.2f ms\n",
+            __func__, module.c_str(), decls.size(), embed_ms, replace_ms);
+
+    return json{
+        {"ok", true},
+        {"cached", false},
+        {"n_declarations", decls.size()},
+        {"embed_ms", embed_ms},
+        {"replace_ms", replace_ms},
+    };
 }
 
 // /select { goal, k, imports?, declarations? } -> [{name,score}, ...]

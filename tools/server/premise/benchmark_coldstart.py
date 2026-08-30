@@ -169,7 +169,7 @@ def main() -> int:
             for module_index, body in enumerate(modules):
                 request_started = time.perf_counter()
                 result = regression.post_json("/cache", body, timeout=args.request_timeout)
-                if result != {"ok": True}:
+                if not regression.cache_ok(result):
                     raise SystemExit(f"/cache failed for {body['module']}: {result!r}")
                 latencies.append(time.perf_counter() - request_started)
                 if (module_index + 1) % 16 == 0 or module_index + 1 == len(modules):

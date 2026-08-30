@@ -220,6 +220,18 @@ def post_json(path: str, body: dict, timeout: int = 120):
         return json.loads(response.read().decode("utf-8"))
 
 
+def cache_ok(result) -> bool:
+    """/cache answers {"ok": true, ...} plus timing fields; only "ok" is contractual."""
+    return isinstance(result, dict) and result.get("ok") is True
+
+
+def cache_timing(result: dict) -> str:
+    return (
+        f"embed {result.get('embed_ms', 0.0):.1f} ms, "
+        f"replace_module {result.get('replace_ms', 0.0):.1f} ms"
+    )
+
+
 def cache_body() -> dict:
     return {
         "module": DEMO_MODULE,
@@ -255,9 +267,10 @@ def run_tests(args: argparse.Namespace) -> bool:
 
     print(f"2. Sending {len(DEMO_DECLARATIONS)} declarations to /cache", flush=True)
     cache_result = post_json("/cache", cache_body())
-    if cache_result != {"ok": True}:
+    if not cache_ok(cache_result):
         print(f"[FAIL] /cache returned {cache_result!r}", file=sys.stderr)
         return False
+    print(f"   {cache_timing(cache_result)}", flush=True)
 
     print("3. Verifying /version returns the cached token", flush=True)
     after = post_json("/version", {"module": DEMO_MODULE})
@@ -286,20 +299,20 @@ def run_tests(args: argparse.Namespace) -> bool:
         return False
 
     print("6. Appending a second module, then re-caching the first", flush=True)
-    if post_json("/cache", {
+    if not cache_ok(post_json("/cache", {
         "module": TAIL_MODULE,
         "token": TAIL_TOKEN,
         "imports": [],
         "declarations": [TAIL_DECLARATION],
-    }) != {"ok": True}:
+    })):
         print("[FAIL] could not cache tail module", file=sys.stderr)
         return False
-    if post_json("/cache", {
+    if not cache_ok(post_json("/cache", {
         "module": DEMO_MODULE,
         "token": REFRESH_TOKEN,
         "imports": [],
         "declarations": [REFRESH_DECLARATION],
-    }) != {"ok": True}:
+    })):
         print("[FAIL] could not refresh first module", file=sys.stderr)
         return False
 
@@ -384,7 +397,11 @@ API
 
 {textwrap.indent(cache_request, "   ")}
 
-   Expected response: {{"ok":true}}
+   Expected response: {{"ok":true,"cached":false,"n_declarations":N,
+                       "embed_ms":...,"replace_ms":...}}
+   The *_ms fields report how long batch embedding took versus writing the
+   module into the index; "cached" is true when the token already matched and
+   no work was done.
 
 3. Confirm the module token now matches.
 
