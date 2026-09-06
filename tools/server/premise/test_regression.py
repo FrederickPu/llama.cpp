@@ -5,7 +5,7 @@ Premise mode is embedding-only retrieval used by CanonicalDrafter to rank Lean
 premises. It does not generate text. The intended flow is:
 
   1. Start: llama-server --premise --model ... --index-db ...
-  2. Ask /version whether one Lean module is already cached.
+  2. Ask /version which Lean modules are already cached.
   3. Send that module's declarations to /cache when the version token is missing or stale.
   4. Call /select with imports, local declarations, a goal, and k.
 
@@ -258,7 +258,11 @@ def run_tests(args: argparse.Namespace) -> bool:
     print(f"Using premise mode at {BASE_URL}", flush=True)
 
     print(f"1. Checking /version for uncached module {DEMO_MODULE!r}", flush=True)
-    before = post_json("/version", {"module": DEMO_MODULE})
+    before_versions = post_json("/version", {"modules": [DEMO_MODULE]})
+    if not isinstance(before_versions, list) or len(before_versions) != 1:
+        print(f"[FAIL] expected one aligned version result, got {before_versions!r}", file=sys.stderr)
+        return False
+    before = before_versions[0]
     if before is not None and not isinstance(before, str):
         print(f"[FAIL] expected null or a version token string, got {before!r}", file=sys.stderr)
         return False
@@ -273,9 +277,9 @@ def run_tests(args: argparse.Namespace) -> bool:
     print(f"   {cache_timing(cache_result)}", flush=True)
 
     print("3. Verifying /version returns the cached token", flush=True)
-    after = post_json("/version", {"module": DEMO_MODULE})
-    if after != DEMO_TOKEN:
-        print(f"[FAIL] expected cached module token, got {after!r}", file=sys.stderr)
+    after = post_json("/version", {"modules": [DEMO_MODULE]})
+    if after != [DEMO_TOKEN]:
+        print(f"[FAIL] expected aligned cached module token, got {after!r}", file=sys.stderr)
         return False
 
     print(f"4. Asking /select for premises relevant to goal {DEMO_GOAL!r}", flush=True)
@@ -328,7 +332,7 @@ def run_tests(args: argparse.Namespace) -> bool:
     if [item["name"] for item in tail] != [TAIL_DECLARATION["name"]]:
         print(f"[FAIL] downstream labels shifted incorrectly: {tail!r}", file=sys.stderr)
         return False
-    if post_json("/version", {"module": TAIL_MODULE}) != TAIL_TOKEN:
+    if post_json("/version", {"modules": [TAIL_MODULE]}) != [TAIL_TOKEN]:
         print("[FAIL] tail module token changed during first-module refresh", file=sys.stderr)
         return False
 
@@ -339,7 +343,7 @@ def run_tests(args: argparse.Namespace) -> bool:
 
 def print_usage_guide(args: argparse.Namespace) -> None:
     server_exe = args.server_bin or find_exe("llama-server") or (BUILD_BIN_DIR / ("llama-server.exe" if os.name == "nt" else "llama-server"))
-    version_request = dump_json({"module": DEMO_MODULE})
+    version_request = dump_json({"modules": [DEMO_MODULE]})
     cache_request = dump_json(cache_body())
     select_request = dump_json(select_body())
     line_continue = "^" if os.name == "nt" else "\\"
@@ -380,14 +384,14 @@ they are not stored in the database.
 API
 ---
 
-1. Check whether the module token is already cached in this process.
+1. Check which module tokens are already cached in this process.
 
    POST http://{args.host}:{args.port}/version
    Content-Type: application/json
 
 {textwrap.indent(version_request, "   ")}
 
-   Expected before /cache: null
+   Expected before /cache: [null]
 
 2. Cache or refresh declarations for that one module (declarations are
    batch-embedded in a single forward pass).
@@ -410,7 +414,7 @@ API
 
 {textwrap.indent(version_request, "   ")}
 
-   Expected after /cache: "{DEMO_TOKEN}"
+   Expected after /cache: ["{DEMO_TOKEN}"]
 
 4. Select premises for a goal.
 
@@ -435,7 +439,7 @@ Notes
     Declaration strings are not persisted.
   - Lean decides which declarations belong to each module and sends fully
     qualified names through /cache; the server does not infer module membership.
-  - /version and /cache are one module per request.
+  - /version accepts multiple modules and returns aligned tokens; /cache remains one module per request.
   - /select can include unsaved local declarations in the request body.
   - --url runs the same demo against an existing premise-mode server and will
     refresh {DEMO_MODULE} in that process.

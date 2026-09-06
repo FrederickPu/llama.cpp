@@ -366,14 +366,28 @@ static std::vector<PremiseIndex::Hit> select_hits(
 // HTTP: POST /version, /cache, /select
 // ---------------------------------------------------------------------------
 
-// /version { "module": "..." } -> token | null
+// /version { "modules": ["..."] } -> [token | null, ...]
 static json handle_version(const json & body) {
-    const std::string module = json_string(body, "module");
-    if (!g_premise || !g_premise->index || module.empty()) {
-        return nullptr;
+    auto requested = body.find("modules");
+    if (requested == body.end() || !requested->is_array()) {
+        throw std::runtime_error("missing modules array");
     }
-    const std::string token = g_premise->index->get_module_version(module);
-    return token.empty() ? json(nullptr) : json(token);
+    std::vector<std::string> modules;
+    modules.reserve(requested->size());
+    for (const auto & module : *requested) {
+        if (!module.is_string()) {
+            throw std::runtime_error("modules must contain only strings");
+        }
+        modules.push_back(module.get<std::string>());
+    }
+    json result = json::array();
+    if (!g_premise || !g_premise->index) {
+        return result;
+    }
+    for (const auto & token : g_premise->index->get_module_versions(modules)) {
+        result.push_back(token.empty() ? json(nullptr) : json(token));
+    }
+    return result;
 }
 
 // milliseconds elapsed since `since`, as a double

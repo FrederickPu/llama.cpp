@@ -101,6 +101,9 @@ int main() {
 
             require(index.size() == 4, "unexpected initial row count");
             require(index.get_module_version("A") == "a1", "module version was not stored");
+            require(index.get_module_versions({"A", "Missing", "A"}) ==
+                    std::vector<std::string>({"a1", "", "a1"}),
+                    "batched module versions were not aligned with the request");
 
             auto global = index.search_global(query_x, 1);
             require(global.size() == 1 && global[0].name == "A.x", "FAISS KNN result mismatch");

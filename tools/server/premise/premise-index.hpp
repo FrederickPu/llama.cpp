@@ -161,6 +161,19 @@ struct PremiseIndex {
         return it == modules.end() ? std::string() : it->second.version_token;
     }
 
+    std::vector<std::string> get_module_versions(const std::vector<std::string> & requested) const {
+        std::lock_guard<std::mutex> lock(mu);
+        require_db();
+        refresh_database_locked();
+        std::vector<std::string> versions;
+        versions.reserve(requested.size());
+        for (const auto & module : requested) {
+            auto it = modules.find(module);
+            versions.push_back(it == modules.end() ? std::string() : it->second.version_token);
+        }
+        return versions;
+    }
+
     void replace_module(const std::string & module,
                         const std::string & version_token,
                         const std::vector<std::string> & imports,
