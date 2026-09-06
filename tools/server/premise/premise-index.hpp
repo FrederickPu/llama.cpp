@@ -8,22 +8,30 @@
 #include <faiss/index_io.h>
 #include <sqlite3.h>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <io.h>
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cmath>
-#include <condition_variable>
 #include <cstdio>
 #include <cstdint>
 #include <cstring>
-#include <exception>
 #include <list>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -53,14 +61,6 @@ struct PremiseIndex {
     using IndexedDeclaration = Candidate;
 
     ~PremiseIndex() {
-        {
-            std::lock_guard<std::mutex> lock(mu);
-            worker_stop = true;
-            worker_cv.notify_all();
-        }
-        if (worker.joinable()) {
-            worker.join();
-        }
         if (db) {
             sqlite3_close_v2(db);
         }
@@ -107,7 +107,7 @@ struct PremiseIndex {
         }
     }
 
-    void open(const std::string & path, int model_dim, size_t rebuild_threshold = 1024) {
+    void open(const std::string & path, int model_dim) {
         std::lock_guard<std::mutex> lock(mu);
         if (db) {
             throw std::runtime_error("premise database is already open");
@@ -121,10 +121,6 @@ struct PremiseIndex {
         if (model_dim > std::numeric_limits<int>::max() / (int) sizeof(float)) {
             throw std::runtime_error("embedding dimension is too large");
         }
-        if (rebuild_threshold == 0) {
-            throw std::runtime_error("invalid FAISS rebuild threshold");
-        }
-
         sqlite3 * opened = nullptr;
         const int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX;
         const int rc = sqlite3_open_v2(path.c_str(), &opened, flags, nullptr);
@@ -137,25 +133,21 @@ struct PremiseIndex {
         }
 
         db = opened;
-        db_path = path;
         sidecar_path = path + ".faiss";
         dim = model_dim;
-        delta_rebuild_threshold = rebuild_threshold;
         sqlite3_extended_result_codes(db, 1);
         sqlite3_busy_timeout(db, 5000);
 
         try {
             exec(db, "PRAGMA foreign_keys = ON");
             exec(db, "PRAGMA journal_mode = WAL");
-            exec(db, "PRAGMA synchronous = NORMAL");
+            exec(db, "PRAGMA synchronous = FULL");
             exec(db, "PRAGMA wal_autocheckpoint = 1000");
             initialize_schema_locked();
             refresh_database_locked(true);
-            worker = std::thread([this]() { rebuild_worker(); });
         } catch (...) {
             sqlite3_close_v2(db);
             db = nullptr;
-            db_path.clear();
             sidecar_path.clear();
             throw;
         }
@@ -200,6 +192,7 @@ struct PremiseIndex {
                 if (content_revision == std::numeric_limits<int64_t>::max()) {
                     throw std::runtime_error("premise database content revision is exhausted");
                 }
+                next_faiss_id = std::max(next_faiss_id, read_faiss_next_id(database_identity));
 
                 Statement delete_module(db, "DELETE FROM premise_modules WHERE module = ?1");
                 delete_module.bind_text(1, module);
@@ -222,25 +215,35 @@ struct PremiseIndex {
                 }
 
                 Statement insert_declaration(db,
-                        "INSERT INTO premise_declarations(module, ordinal, name) VALUES(?1, ?2, ?3)");
-                Statement insert_embedding(db,
-                        "INSERT INTO premise_declaration_embeddings(declaration_id, embedding) VALUES(?1, ?2)");
+                        "INSERT INTO premise_declarations(id, module, ordinal, name) VALUES(?1, ?2, ?3, ?4)");
                 new_ids.clear();
                 new_ids.reserve(accepted.size());
+                std::vector<float> embeddings;
+                embeddings.reserve(accepted.size() * (size_t) dim);
+                uint64_t candidate_next_id = next_faiss_id;
                 for (size_t i = 0; i < accepted.size(); ++i) {
-                    insert_declaration.bind_text(1, module);
-                    insert_declaration.bind_int64(2, checked_int64(i, "too many declarations"));
-                    insert_declaration.bind_text(3, accepted[i]->name);
+                    if (candidate_next_id > (uint64_t) std::numeric_limits<faiss::idx_t>::max()) {
+                        throw std::runtime_error("premise FAISS declaration IDs are exhausted");
+                    }
+                    const faiss::idx_t id = (faiss::idx_t) candidate_next_id++;
+                    insert_declaration.bind_int64(1, id);
+                    insert_declaration.bind_text(2, module);
+                    insert_declaration.bind_int64(3, checked_int64(i, "too many declarations"));
+                    insert_declaration.bind_text(4, accepted[i]->name);
                     insert_declaration.run();
-                    const faiss::idx_t id = sqlite3_last_insert_rowid(db);
                     insert_declaration.reset();
-
-                    insert_embedding.bind_int64(1, id);
-                    insert_embedding.bind_vector(2, accepted[i]->embedding);
-                    insert_embedding.run();
-                    insert_embedding.reset();
                     new_ids.push_back(id);
+                    embeddings.insert(embeddings.end(),
+                            accepted[i]->embedding.begin(), accepted[i]->embedding.end());
                 }
+
+                if (!new_ids.empty()) {
+                    base_index->add_with_ids(
+                            (faiss::idx_t) new_ids.size(), embeddings.data(), new_ids.data());
+                    base_ids.insert(new_ids.begin(), new_ids.end());
+                }
+                persist_faiss_index(*base_index, base_ids, database_identity, candidate_next_id);
+                next_faiss_id = candidate_next_id;
 
                 Statement update_revision(db,
                         "UPDATE premise_config SET content_revision = content_revision + 1 WHERE id = 1");
@@ -252,6 +255,10 @@ struct PremiseIndex {
                 break;
             } catch (...) {
                 rollback(db);
+                try {
+                    refresh_database_locked(true);
+                } catch (...) {
+                }
                 throw;
             }
         }
@@ -273,8 +280,6 @@ struct PremiseIndex {
         validate_vector(query, dim, "query embedding");
 
         std::vector<Hit> hits = search_base(query, top_k, nullptr);
-        const std::vector<Candidate> locals;
-        score_exact(query, nullptr, locals, nullptr, hits);
         trim_hits(hits, top_k);
         return hits;
     }
@@ -299,26 +304,12 @@ struct PremiseIndex {
             for (const auto & root : import_roots) {
                 collect_candidate_rows(root, visited, scope_cache.names, scope_cache.ids);
             }
-            if (!delta_ids.empty()) {
-                scope_cache.id_set.insert(scope_cache.ids.begin(), scope_cache.ids.end());
-            }
         }
 
         std::vector<Hit> hits = search_base(query, top_k, &scope_cache.ids);
-        score_exact(query, delta_ids.empty() ? nullptr : &scope_cache.id_set,
-                locals, &scope_cache.names, hits);
+        score_locals(query, locals, &scope_cache.names, hits);
         trim_hits(hits, top_k);
         return hits;
-    }
-
-    void wait_for_rebuild_for_test() const {
-        std::unique_lock<std::mutex> lock(mu);
-        require_db();
-        refresh_database_locked();
-        worker_cv.wait(lock, [this]() { return !worker_building && !worker_requested; });
-        if (worker_error) {
-            std::rethrow_exception(worker_error);
-        }
     }
 
     bool loaded_sidecar_for_test() const {
@@ -334,7 +325,6 @@ private:
     struct Row {
         std::string name;
         std::string module;
-        std::vector<float> embedding;
     };
 
     struct DatabaseState {
@@ -347,9 +337,8 @@ private:
     struct FaissCandidate {
         std::unique_ptr<faiss::IndexIDMap2> index;
         std::unordered_set<faiss::idx_t> ids;
-        std::unordered_set<faiss::idx_t> delta_ids;
         std::array<uint8_t, 16> identity = {};
-        int64_t revision = 0;
+        uint64_t next_id = 1;
         bool loaded = false;
     };
 
@@ -357,7 +346,6 @@ private:
         int64_t revision = -1;
         std::vector<std::string> import_roots;
         std::vector<faiss::idx_t> ids;
-        std::unordered_set<faiss::idx_t> id_set;
         std::unordered_set<std::string> names;
     };
 
@@ -391,14 +379,6 @@ private:
             check(sqlite3_bind_text(stmt, index, value.data(), (int) value.size(), SQLITE_TRANSIENT));
         }
 
-        void bind_vector(int index, const std::vector<float> & value) {
-            const size_t bytes = value.size() * sizeof(float);
-            if (bytes > (size_t) std::numeric_limits<int>::max()) {
-                throw std::runtime_error("embedding is too large for SQLite");
-            }
-            check(sqlite3_bind_blob(stmt, index, value.data(), (int) bytes, SQLITE_TRANSIENT));
-        }
-
         bool step() {
             const int rc = sqlite3_step(stmt);
             if (rc == SQLITE_ROW) {
@@ -430,30 +410,22 @@ private:
     };
 
     sqlite3 * db = nullptr;
-    std::string db_path;
     std::string sidecar_path;
     mutable std::array<uint8_t, 16> database_identity = {};
+    mutable uint64_t next_faiss_id = 1;
     int dim = 0;
-    size_t delta_rebuild_threshold = 1024;
     mutable int observed_data_version = -1;
     mutable int64_t content_revision = 0;
     mutable std::unordered_map<faiss::idx_t, Row> rows;
     mutable std::unordered_map<std::string, ModuleEntry> modules;
     mutable std::unique_ptr<faiss::IndexIDMap2> base_index;
     mutable std::unordered_set<faiss::idx_t> base_ids;
-    mutable std::unordered_set<faiss::idx_t> delta_ids;
     mutable ScopeCache scope_cache;
     std::mutex local_cache_mu;
     LocalCache local_cache;
     std::unordered_map<std::string, LocalCache::iterator> local_cache_index;
     mutable std::mutex mu;
-    mutable std::condition_variable worker_cv;
-    std::thread worker;
-    mutable bool worker_stop = false;
-    mutable bool worker_requested = false;
-    mutable bool worker_building = false;
     mutable bool sidecar_loaded = false;
-    mutable std::exception_ptr worker_error;
 
     void require_db() const {
         if (!db) {
@@ -598,27 +570,8 @@ private:
         }
     }
 
-    inline static constexpr char SIDECAR_MAGIC[8] = {'P', 'M', 'F', 'A', 'I', 'S', '0', '1'};
-    inline static constexpr uint32_t SIDECAR_VERSION = 1;
-
-    static void validate_stored_vector(const void * blob, int bytes, int dimensions) {
-        if (!blob || bytes != dimensions * (int) sizeof(float)) {
-            throw std::runtime_error("stored embedding dimension mismatch");
-        }
-        const uint8_t * data = static_cast<const uint8_t *>(blob);
-        double norm_squared = 0.0;
-        for (int i = 0; i < dimensions; ++i) {
-            float value;
-            std::memcpy(&value, data + (size_t) i * sizeof(float), sizeof(value));
-            if (!std::isfinite(value)) {
-                throw std::runtime_error("stored embedding contains a non-finite component");
-            }
-            norm_squared += (double) value * value;
-        }
-        if (!std::isfinite(norm_squared) || std::fabs(norm_squared - 1.0) > 1e-3) {
-            throw std::runtime_error("stored embedding is not approximately unit normalized");
-        }
-    }
+    inline static constexpr char SIDECAR_MAGIC[8] = {'P', 'M', 'F', 'A', 'I', 'S', '0', '2'};
+    inline static constexpr uint32_t SIDECAR_VERSION = 2;
 
     static DatabaseState read_database_state(sqlite3 * database, int dimensions) {
         DatabaseState state;
@@ -665,10 +618,7 @@ private:
         }
 
         Statement read_declarations(database,
-                "SELECT d.id, d.module, d.name, e.declaration_id "
-                "FROM premise_declarations AS d "
-                "LEFT JOIN premise_declaration_embeddings AS e ON e.declaration_id = d.id "
-                "ORDER BY d.module, d.ordinal");
+                "SELECT id, module, name FROM premise_declarations ORDER BY module, ordinal");
         while (read_declarations.step()) {
             const faiss::idx_t id = sqlite3_column_int64(read_declarations.stmt, 0);
             const std::string module = column_text(read_declarations.stmt, 1);
@@ -677,20 +627,10 @@ private:
             if (id <= 0 || name.empty() || module_it == state.modules.end()) {
                 throw std::runtime_error("invalid declaration metadata in premise database");
             }
-            if (sqlite3_column_type(read_declarations.stmt, 3) != SQLITE_INTEGER ||
-                    sqlite3_column_int64(read_declarations.stmt, 3) != id) {
-                throw std::runtime_error("premise declaration is missing its embedding");
-            }
-            if (!state.rows.emplace(id, Row{name, module, {}}).second) {
+            if (!state.rows.emplace(id, Row{name, module}).second) {
                 throw std::runtime_error("duplicate declaration ID in premise database");
             }
             module_it->second.declaration_ids.push_back(id);
-        }
-
-        Statement count_embeddings(database, "SELECT COUNT(*) FROM premise_declaration_embeddings");
-        if (!count_embeddings.step() || sqlite3_column_int64(count_embeddings.stmt, 0) !=
-                (int64_t) state.rows.size()) {
-            throw std::runtime_error("premise embedding/declaration row count mismatch");
         }
         return state;
     }
@@ -699,53 +639,6 @@ private:
         auto result = std::make_unique<faiss::IndexIDMap2>(new faiss::IndexFlatIP(dimensions));
         result->own_fields = true;
         return result;
-    }
-
-    static FaissCandidate build_faiss_candidate(
-            sqlite3 * database, const DatabaseState & state, int dimensions) {
-        FaissCandidate candidate;
-        candidate.index = make_index(dimensions);
-        candidate.ids.reserve(state.rows.size());
-        candidate.identity = state.identity;
-        candidate.revision = state.revision;
-
-        constexpr size_t batch_size = 1024;
-        std::vector<faiss::idx_t> ids;
-        std::vector<float> embeddings;
-        ids.reserve(std::min(batch_size, state.rows.size()));
-        if ((size_t) dimensions > std::numeric_limits<size_t>::max() / batch_size) {
-            throw std::runtime_error("premise embedding dimension is too large");
-        }
-        embeddings.reserve(std::min(batch_size, state.rows.size()) * (size_t) dimensions);
-
-        Statement read_embeddings(database,
-                "SELECT declaration_id, embedding "
-                "FROM premise_declaration_embeddings ORDER BY declaration_id");
-        while (read_embeddings.step()) {
-            const faiss::idx_t id = sqlite3_column_int64(read_embeddings.stmt, 0);
-            const int bytes = sqlite3_column_bytes(read_embeddings.stmt, 1);
-            const void * blob = sqlite3_column_blob(read_embeddings.stmt, 1);
-            if (state.rows.find(id) == state.rows.end() || !candidate.ids.insert(id).second) {
-                throw std::runtime_error("invalid declaration embedding ID");
-            }
-            validate_stored_vector(blob, bytes, dimensions);
-            ids.push_back(id);
-            const size_t offset = embeddings.size();
-            embeddings.resize(offset + (size_t) dimensions);
-            std::memcpy(embeddings.data() + offset, blob, (size_t) bytes);
-            if (ids.size() == batch_size) {
-                candidate.index->add_with_ids((faiss::idx_t) ids.size(), embeddings.data(), ids.data());
-                ids.clear();
-                embeddings.clear();
-            }
-        }
-        if (!ids.empty()) {
-            candidate.index->add_with_ids((faiss::idx_t) ids.size(), embeddings.data(), ids.data());
-        }
-        if (candidate.ids.size() != state.rows.size()) {
-            throw std::runtime_error("premise embedding/declaration row count mismatch");
-        }
-        return candidate;
     }
 
     static void read_exact(FILE * file, void * data, size_t size) {
@@ -795,6 +688,39 @@ private:
         write_exact(file, data, sizeof(data));
     }
 
+    uint64_t read_faiss_next_id(const std::array<uint8_t, 16> & expected_identity) const {
+        FILE * file = std::fopen(sidecar_path.c_str(), "rb");
+        if (!file) {
+            throw std::runtime_error("cannot open premise FAISS sidecar");
+        }
+        try {
+            char magic[sizeof(SIDECAR_MAGIC)];
+            read_exact(file, magic, sizeof(magic));
+            if (std::memcmp(magic, SIDECAR_MAGIC, sizeof(magic)) != 0 ||
+                    read_u32(file) != SIDECAR_VERSION ||
+                    read_u32(file) != (uint32_t) premise_schema::VERSION) {
+                throw std::runtime_error("invalid premise FAISS sidecar header");
+            }
+            std::array<uint8_t, 16> identity;
+            read_exact(file, identity.data(), identity.size());
+            const uint64_t next_id = read_u64(file);
+            if (identity != expected_identity || next_id == 0 ||
+                    next_id > (uint64_t) std::numeric_limits<faiss::idx_t>::max() + 1ULL) {
+                throw std::runtime_error("premise FAISS sidecar does not match database");
+            }
+            if (std::fclose(file) != 0) {
+                file = nullptr;
+                throw std::runtime_error("cannot close premise FAISS sidecar");
+            }
+            return next_id;
+        } catch (...) {
+            if (file) {
+                std::fclose(file);
+            }
+            throw;
+        }
+    }
+
     std::unique_ptr<FaissCandidate> load_faiss_candidate(const DatabaseState & state) const {
         FILE * file = std::fopen(sidecar_path.c_str(), "rb");
         if (!file) {
@@ -810,11 +736,12 @@ private:
             }
             std::array<uint8_t, 16> identity;
             read_exact(file, identity.data(), identity.size());
-            const uint64_t revision = read_u64(file);
+            const uint64_t next_id = read_u64(file);
             const uint32_t dimensions = read_u32(file);
             const uint64_t row_count = read_u64(file);
             if (identity != state.identity ||
-                    revision > (uint64_t) state.revision ||
+                    next_id == 0 ||
+                    next_id > (uint64_t) std::numeric_limits<faiss::idx_t>::max() + 1ULL ||
                     dimensions != (uint32_t) dim ||
                     row_count > (uint64_t) std::numeric_limits<faiss::idx_t>::max()) {
                 throw std::runtime_error("premise FAISS sidecar does not match database");
@@ -839,7 +766,7 @@ private:
             auto candidate = std::make_unique<FaissCandidate>();
             candidate->ids.reserve(map->id_map.size());
             for (faiss::idx_t id : map->id_map) {
-                if (id <= 0 || !candidate->ids.insert(id).second) {
+                if (id <= 0 || (uint64_t) id >= next_id || !candidate->ids.insert(id).second) {
                     throw std::runtime_error("invalid premise FAISS sidecar declaration IDs");
                 }
             }
@@ -847,7 +774,7 @@ private:
             serialized.release();
             candidate->index.reset(map);
             candidate->identity = state.identity;
-            candidate->revision = (int64_t) revision;
+            candidate->next_id = next_id;
             candidate->loaded = true;
             const int close_rc = std::fclose(file);
             file = nullptr;
@@ -863,45 +790,15 @@ private:
         }
     }
 
-    static void load_delta_embeddings(
-            sqlite3 * database,
-            std::unordered_map<faiss::idx_t, Row> & state_rows,
-            const std::unordered_set<faiss::idx_t> & ids,
-            int dimensions) {
-        if (ids.empty()) {
-            return;
+    static void select_active_faiss_ids(
+            const DatabaseState & state,
+            FaissCandidate & candidate) {
+        for (const auto & item : state.rows) {
+            if (candidate.ids.find(item.first) == candidate.ids.end()) {
+                throw std::runtime_error("premise FAISS sidecar is missing an active declaration ID");
+            }
         }
-        Statement read_embedding(database,
-                "SELECT embedding FROM premise_declaration_embeddings WHERE declaration_id = ?1");
-        for (faiss::idx_t id : ids) {
-            auto row = state_rows.find(id);
-            if (row == state_rows.end()) {
-                throw std::runtime_error("delta embedding references an unknown declaration");
-            }
-            read_embedding.bind_int64(1, id);
-            if (!read_embedding.step() || sqlite3_column_type(read_embedding.stmt, 0) != SQLITE_BLOB) {
-                throw std::runtime_error("premise delta is missing an embedding");
-            }
-            const int bytes = sqlite3_column_bytes(read_embedding.stmt, 0);
-            const void * blob = sqlite3_column_blob(read_embedding.stmt, 0);
-            validate_stored_vector(blob, bytes, dimensions);
-            row->second.embedding.resize((size_t) dimensions);
-            std::memcpy(row->second.embedding.data(), blob, (size_t) bytes);
-            if (read_embedding.step()) {
-                throw std::runtime_error("premise delta has duplicate embeddings");
-            }
-            read_embedding.reset();
-        }
-    }
 
-    static void reconcile_faiss_candidate(
-            sqlite3 * database,
-            DatabaseState & state,
-            FaissCandidate & candidate,
-            int dimensions) {
-        if (candidate.revision > state.revision) {
-            throw std::runtime_error("premise FAISS sidecar revision is newer than database");
-        }
         std::vector<faiss::idx_t> stale;
         for (faiss::idx_t id : candidate.ids) {
             if (state.rows.find(id) == state.rows.end()) {
@@ -917,33 +814,63 @@ private:
                 candidate.ids.erase(id);
             }
         }
+    }
 
-        candidate.delta_ids.clear();
-        candidate.delta_ids.reserve(state.rows.size() -
-                std::min(state.rows.size(), candidate.ids.size()));
-        for (const auto & item : state.rows) {
-            if (candidate.ids.find(item.first) == candidate.ids.end()) {
-                candidate.delta_ids.insert(item.first);
-            }
+    static void sync_file(FILE * file) {
+        if (std::fflush(file) != 0) {
+            throw std::runtime_error("cannot flush premise FAISS sidecar");
         }
-        load_delta_embeddings(database, state.rows, candidate.delta_ids, dimensions);
+#if defined(_WIN32)
+        if (_commit(_fileno(file)) != 0) {
+#else
+        if (fsync(fileno(file)) != 0) {
+#endif
+            throw std::runtime_error("cannot sync premise FAISS sidecar");
+        }
     }
 
-    FaissCandidate load_or_build_faiss_candidate(
-            sqlite3 * database,
-            DatabaseState & state,
-            bool allow_sidecar) const {
-        std::unique_ptr<FaissCandidate> loaded = allow_sidecar ? load_faiss_candidate(state) : nullptr;
-        FaissCandidate candidate = loaded ? std::move(*loaded) : build_faiss_candidate(database, state, dim);
-        reconcile_faiss_candidate(database, state, candidate, dim);
-        return candidate;
+    void install_sidecar_file(const std::string & temp_path) const {
+#if defined(_WIN32)
+        if (!MoveFileExA(temp_path.c_str(), sidecar_path.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            throw std::runtime_error("cannot install premise FAISS sidecar");
+        }
+#else
+        if (std::rename(temp_path.c_str(), sidecar_path.c_str()) != 0) {
+            throw std::runtime_error("cannot install premise FAISS sidecar");
+        }
+        const size_t slash = sidecar_path.find_last_of('/');
+        const std::string directory = slash == std::string::npos ? "." :
+                (slash == 0 ? "/" : sidecar_path.substr(0, slash));
+        int flags = O_RDONLY;
+#ifdef O_DIRECTORY
+        flags |= O_DIRECTORY;
+#endif
+        const int directory_fd = open(directory.c_str(), flags);
+        if (directory_fd < 0 || fsync(directory_fd) != 0) {
+            if (directory_fd >= 0) {
+                close(directory_fd);
+            }
+            throw std::runtime_error("cannot sync premise FAISS sidecar directory");
+        }
+        close(directory_fd);
+#endif
     }
 
-    void persist_faiss_candidate(const FaissCandidate & candidate) const {
-        if (!candidate.index || candidate.revision < 0 ||
-                candidate.index->ntotal < 0 ||
-                (size_t) candidate.index->ntotal != candidate.ids.size()) {
+    void persist_faiss_index(
+            const faiss::IndexIDMap2 & index,
+            const std::unordered_set<faiss::idx_t> & ids,
+            const std::array<uint8_t, 16> & identity,
+            uint64_t next_id) const {
+        if (next_id == 0 ||
+                next_id > (uint64_t) std::numeric_limits<faiss::idx_t>::max() + 1ULL ||
+                index.ntotal < 0 || (size_t) index.ntotal != ids.size()) {
             throw std::runtime_error("cannot persist invalid premise FAISS candidate");
+        }
+        for (faiss::idx_t id : ids) {
+            if (id <= 0 || (uint64_t) id >= next_id) {
+                throw std::runtime_error("cannot persist invalid premise FAISS declaration ID");
+            }
         }
         const std::string temp_path = sidecar_path + ".tmp";
         std::remove(temp_path.c_str());
@@ -955,25 +882,18 @@ private:
             write_exact(file, SIDECAR_MAGIC, sizeof(SIDECAR_MAGIC));
             write_u32(file, SIDECAR_VERSION);
             write_u32(file, (uint32_t) premise_schema::VERSION);
-            write_exact(file, candidate.identity.data(), candidate.identity.size());
-            write_u64(file, (uint64_t) candidate.revision);
+            write_exact(file, identity.data(), identity.size());
+            write_u64(file, next_id);
             write_u32(file, (uint32_t) dim);
-            write_u64(file, (uint64_t) candidate.ids.size());
-            faiss::write_index(candidate.index.get(), file);
-            if (std::fflush(file) != 0) {
-                throw std::runtime_error("cannot flush premise FAISS sidecar");
-            }
+            write_u64(file, (uint64_t) ids.size());
+            faiss::write_index(&index, file);
+            sync_file(file);
             const int close_rc = std::fclose(file);
             file = nullptr;
             if (close_rc != 0) {
                 throw std::runtime_error("cannot finish premise FAISS sidecar");
             }
-            if (std::rename(temp_path.c_str(), sidecar_path.c_str()) != 0) {
-                std::remove(sidecar_path.c_str());
-                if (std::rename(temp_path.c_str(), sidecar_path.c_str()) != 0) {
-                    throw std::runtime_error("cannot install premise FAISS sidecar");
-                }
-            }
+            install_sidecar_file(temp_path);
         } catch (...) {
             if (file) {
                 std::fclose(file);
@@ -983,121 +903,47 @@ private:
         }
     }
 
-    void try_persist_faiss_candidate(const FaissCandidate & candidate) const noexcept {
-        try {
-            persist_faiss_candidate(candidate);
-        } catch (...) {
-            std::remove((sidecar_path + ".tmp").c_str());
-        }
-    }
-
-    bool install_faiss_candidate_locked(
-            DatabaseState * state,
-            FaissCandidate && candidate,
-            int current_data_version = -1) const {
-        if (state) {
-            if (candidate.identity != state->identity || candidate.revision > state->revision) {
-                throw std::runtime_error("FAISS candidate does not match premise database state");
-            }
-            if (!candidate.loaded) {
-                try_persist_faiss_candidate(candidate);
-            }
-            rows = std::move(state->rows);
-            modules = std::move(state->modules);
-            database_identity = state->identity;
-            content_revision = state->revision;
-            observed_data_version = current_data_version;
-            base_index = std::move(candidate.index);
-            base_ids = std::move(candidate.ids);
-            delta_ids = std::move(candidate.delta_ids);
-            sidecar_loaded = candidate.loaded;
-            worker_requested = delta_ids.size() >= delta_rebuild_threshold;
-            worker_error = nullptr;
-            if (worker_requested) {
-                worker_cv.notify_all();
-            }
-            worker_cv.notify_all();
-            return true;
-        }
-
-        if (candidate.identity != database_identity ||
-                data_version_locked() != observed_data_version ||
-                read_content_revision(db) != content_revision ||
-                candidate.revision > content_revision) {
-            return false;
-        }
-
-        std::vector<faiss::idx_t> stale;
-        for (faiss::idx_t id : candidate.ids) {
-            if (rows.find(id) == rows.end()) {
-                stale.push_back(id);
-            }
-        }
-        if (!stale.empty()) {
-            faiss::IDSelectorBatch remove(stale.size(), stale.data());
-            if (candidate.index->remove_ids(remove) != stale.size()) {
-                throw std::runtime_error("failed to reconcile rebuilt FAISS IDs");
-            }
-            for (faiss::idx_t id : stale) {
-                candidate.ids.erase(id);
-            }
-        }
-
-        candidate.delta_ids.clear();
-        candidate.delta_ids.reserve(rows.size() - std::min(rows.size(), candidate.ids.size()));
-        for (const auto & item : rows) {
-            if (candidate.ids.find(item.first) == candidate.ids.end()) {
-                if ((int) item.second.embedding.size() != dim) {
-                    throw std::runtime_error("current premise delta is missing an embedding");
-                }
-                candidate.delta_ids.insert(item.first);
-            }
-        }
-
-        // Post-snapshot rows stay exact and are not serialized into this candidate.
-        try_persist_faiss_candidate(candidate);
-        for (faiss::idx_t id : candidate.ids) {
-            auto row = rows.find(id);
-            if (row == rows.end()) {
-                throw std::runtime_error("rebuilt FAISS candidate contains an unknown declaration");
-            }
-            row->second.embedding.clear();
-        }
-        base_index = std::move(candidate.index);
-        base_ids = std::move(candidate.ids);
-        delta_ids = std::move(candidate.delta_ids);
-        worker_requested = delta_ids.size() >= delta_rebuild_threshold;
-        if (worker_requested) {
-            worker_cv.notify_all();
-        }
-        return true;
-    }
-
     void refresh_database_locked(bool force = false) const {
-        int before = data_version_locked();
+        const int before = data_version_locked();
         if (!force && before == observed_data_version) {
             return;
         }
-        for (;;) {
-            DatabaseState state;
-            FaissCandidate candidate;
-            exec(db, "BEGIN");
-            try {
-                state = read_database_state(db, dim);
-                candidate = load_or_build_faiss_candidate(db, state, true);
-                exec(db, "COMMIT");
-            } catch (...) {
-                rollback(db);
-                throw;
+
+        DatabaseState state;
+        FaissCandidate candidate;
+        int snapshot_data_version = before;
+        exec(db, "BEGIN IMMEDIATE");
+        try {
+            snapshot_data_version = data_version_locked();
+            state = read_database_state(db, dim);
+            std::unique_ptr<FaissCandidate> loaded = load_faiss_candidate(state);
+            if (loaded) {
+                candidate = std::move(*loaded);
+            } else {
+                if (!state.rows.empty()) {
+                    throw std::runtime_error("premise database references a missing or invalid FAISS sidecar");
+                }
+                candidate.index = make_index(dim);
+                candidate.identity = state.identity;
+                persist_faiss_index(*candidate.index, candidate.ids, candidate.identity, candidate.next_id);
             }
-            const int after = data_version_locked();
-            if (before != after) {
-                before = after;
-                continue;
-            }
-            install_faiss_candidate_locked(&state, std::move(candidate), after);
-            return;
+            select_active_faiss_ids(state, candidate);
+            exec(db, "COMMIT");
+        } catch (...) {
+            rollback(db);
+            throw;
         }
+
+        rows = std::move(state.rows);
+        modules = std::move(state.modules);
+        database_identity = state.identity;
+        next_faiss_id = candidate.next_id;
+        content_revision = state.revision;
+        observed_data_version = snapshot_data_version;
+        base_index = std::move(candidate.index);
+        base_ids = std::move(candidate.ids);
+        sidecar_loaded = candidate.loaded;
+        scope_cache = {};
     }
 
     void apply_committed_replacement_locked(
@@ -1129,7 +975,6 @@ private:
         for (faiss::idx_t id : old_ids) {
             rows.erase(id);
             base_ids.erase(id);
-            delta_ids.erase(id);
         }
 
         ModuleEntry & entry = modules[module];
@@ -1138,86 +983,10 @@ private:
         entry.declaration_ids = new_ids;
         for (size_t i = 0; i < new_ids.size(); ++i) {
             const faiss::idx_t id = new_ids[i];
-            rows.emplace(id, Row{accepted[i]->name, module, accepted[i]->embedding});
-            delta_ids.insert(id);
+            rows.emplace(id, Row{accepted[i]->name, module});
         }
         ++content_revision;
-        schedule_rebuild_locked();
-    }
-
-    void schedule_rebuild_locked() const {
-        if (delta_ids.size() >= delta_rebuild_threshold) {
-            worker_requested = true;
-            worker_error = nullptr;
-            worker_cv.notify_all();
-        }
-    }
-
-    void rebuild_worker() {
-        std::unique_lock<std::mutex> lock(mu);
-        for (;;) {
-            worker_cv.wait(lock, [this]() { return worker_stop || worker_requested; });
-            if (worker_stop) {
-                return;
-            }
-            worker_requested = false;
-            worker_building = true;
-            lock.unlock();
-
-            std::exception_ptr error;
-            std::unique_ptr<FaissCandidate> candidate;
-            sqlite3 * worker_db = nullptr;
-            try {
-                const int flags = SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX;
-                const int rc = sqlite3_open_v2(db_path.c_str(), &worker_db, flags, nullptr);
-                if (rc != SQLITE_OK) {
-                    const std::string message = worker_db ?
-                            sqlite3_errmsg(worker_db) : "cannot allocate SQLite connection";
-                    if (worker_db) {
-                        sqlite3_close_v2(worker_db);
-                        worker_db = nullptr;
-                    }
-                    throw std::runtime_error("cannot open premise rebuild snapshot: " + message);
-                }
-                sqlite3_busy_timeout(worker_db, 5000);
-                exec(worker_db, "BEGIN");
-                DatabaseState state = read_database_state(worker_db, dim);
-                candidate = std::make_unique<FaissCandidate>(
-                        load_or_build_faiss_candidate(worker_db, state, false));
-                exec(worker_db, "COMMIT");
-                const int close_rc = sqlite3_close_v2(worker_db);
-                worker_db = nullptr;
-                if (close_rc != SQLITE_OK) {
-                    throw std::runtime_error("cannot close premise rebuild snapshot");
-                }
-            } catch (...) {
-                if (worker_db) {
-                    rollback(worker_db);
-                    sqlite3_close_v2(worker_db);
-                }
-                error = std::current_exception();
-            }
-
-            lock.lock();
-            if (worker_stop) {
-                worker_building = false;
-                worker_cv.notify_all();
-                return;
-            }
-            if (!error) {
-                try {
-                    install_faiss_candidate_locked(nullptr, std::move(*candidate));
-                } catch (...) {
-                    error = std::current_exception();
-                }
-            }
-            worker_building = false;
-            worker_error = error;
-            if (error) {
-                worker_requested = false;
-            }
-            worker_cv.notify_all();
-        }
+        scope_cache = {};
     }
 
     std::vector<Hit> search_base(
@@ -1263,27 +1032,11 @@ private:
         return hits;
     }
 
-    void score_exact(
+    void score_locals(
             const float * query,
-            const std::unordered_set<faiss::idx_t> * eligible_ids,
             const std::vector<Candidate> & locals,
             const std::unordered_set<std::string> * indexed_names,
             std::vector<Hit> & hits) const {
-        for (faiss::idx_t id : delta_ids) {
-            if (eligible_ids && eligible_ids->find(id) == eligible_ids->end()) {
-                continue;
-            }
-            auto row = rows.find(id);
-            if (row == rows.end()) {
-                continue;
-            }
-            float score = 0.0f;
-            for (int i = 0; i < dim; ++i) {
-                score += query[i] * row->second.embedding[(size_t) i];
-            }
-            hits.push_back({row->second.name, row->second.module, score});
-        }
-
         std::unordered_set<std::string> local_names;
         for (const auto & local : locals) {
             if (local.name.empty() ||

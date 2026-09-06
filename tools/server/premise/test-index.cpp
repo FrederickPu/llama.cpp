@@ -56,6 +56,8 @@ int main() {
     const auto corrupt_path = temp / ("llama-premise-index-corrupt-" + std::to_string(suffix) + ".db");
     const auto identity_a_path = temp / ("llama-premise-index-identity-a-" + std::to_string(suffix) + ".db");
     const auto identity_b_path = temp / ("llama-premise-index-identity-b-" + std::to_string(suffix) + ".db");
+    const auto rollback_path = temp / ("llama-premise-index-rollback-" + std::to_string(suffix) + ".db");
+    const auto rollback_snapshot_path = temp / ("llama-premise-index-rollback-snapshot-" + std::to_string(suffix) + ".db");
     const auto v1_path = temp / ("llama-premise-index-v1-" + std::to_string(suffix) + ".db");
     remove_database(path);
     remove_database(worker_path);
@@ -63,6 +65,8 @@ int main() {
     remove_database(corrupt_path);
     remove_database(identity_a_path);
     remove_database(identity_b_path);
+    remove_database(rollback_path);
+    remove_database(rollback_snapshot_path);
     remove_database(v1_path);
 
     try {
@@ -71,7 +75,7 @@ int main() {
 
         {
             PremiseIndex index;
-            index.open(path.string(), 2, 10000);
+            index.open(path.string(), 2);
             require(std::filesystem::exists(path.string() + ".faiss"),
                     "first open did not persist a FAISS sidecar");
             require(!index.loaded_sidecar_for_test(), "first open unexpectedly loaded a sidecar");
@@ -99,8 +103,8 @@ int main() {
             require(index.get_module_version("A") == "a1", "module version was not stored");
 
             auto global = index.search_global(query_x, 1);
-            require(global.size() == 1 && global[0].name == "A.x", "delta KNN result mismatch");
-            require(std::fabs(global[0].score - 1.0f) < 1e-5f, "delta KNN score mismatch");
+            require(global.size() == 1 && global[0].name == "A.x", "FAISS KNN result mismatch");
+            require(std::fabs(global[0].score - 1.0f) < 1e-5f, "FAISS KNN score mismatch");
 
             auto scoped = index.search_scoped(query_y, {"B"}, {}, 8);
             require(scoped.size() == 3, "scoped search did not apply name shadowing");
@@ -131,7 +135,7 @@ int main() {
 
         {
             PremiseIndex index;
-            index.open(path.string(), 2, 10000);
+            index.open(path.string(), 2);
             require(index.loaded_sidecar_for_test(), "second open did not load the FAISS sidecar");
             require(index.size() == 3, "rows did not survive database reopen");
             require(index.get_module_version("A") == "a2", "version did not survive database reopen");
@@ -146,7 +150,7 @@ int main() {
             });
             global = index.search_global(query_y, 2);
             require(has_hit(global, "A.x") && has_hit(global, "Delta.diagonal"),
-                    "base and delta results were not merged");
+                    "newly flushed FAISS results were not searchable");
 
             const std::string nul_module("N\0M", 3);
             const std::string nul_token("t\0x", 3);
@@ -179,12 +183,12 @@ int main() {
             }
             index.replace_module("Bulk", "bulk1", {}, bulk);
             auto large = index.search_scoped(query_x, {"Bulk"}, {}, 4097);
-            require(large.size() == 4097, "large delta scoped KNN query was truncated");
+            require(large.size() == 4097, "large scoped KNN query was truncated");
         }
 
         {
             PremiseIndex index;
-            index.open(path.string(), 2, 10000);
+            index.open(path.string(), 2);
             auto large = index.search_scoped(query_x, {"Bulk"}, {}, 4097);
             require(large.size() == 4097, "large base scoped KNN query was truncated");
             large = index.search_global(query_x, 4097);
@@ -197,27 +201,18 @@ int main() {
                     "could not inspect premise database");
             sqlite3_stmt * statement = nullptr;
             require(sqlite3_prepare_v2(raw,
-                    "SELECT type FROM sqlite_schema WHERE name = 'premise_declaration_embeddings'",
+                    "SELECT 1 FROM sqlite_schema WHERE name = 'premise_declaration_embeddings'",
                     -1, &statement, nullptr) == SQLITE_OK,
                     "could not inspect embedding schema");
-            require(sqlite3_step(statement) == SQLITE_ROW &&
-                    std::string(reinterpret_cast<const char *>(sqlite3_column_text(statement, 0))) == "table",
-                    "declaration embeddings are not an ordinary table");
-            sqlite3_finalize(statement);
-            require(sqlite3_prepare_v2(raw,
-                    "SELECT typeof(embedding) FROM premise_declaration_embeddings LIMIT 1",
-                    -1, &statement, nullptr) == SQLITE_OK,
-                    "could not inspect stored embedding");
-            require(sqlite3_step(statement) == SQLITE_ROW &&
-                    std::string(reinterpret_cast<const char *>(sqlite3_column_text(statement, 0))) == "blob",
-                    "embedding was not stored as a BLOB");
+            require(sqlite3_step(statement) == SQLITE_DONE,
+                    "declaration embeddings were duplicated in SQLite");
             sqlite3_finalize(statement);
             require(sqlite3_prepare_v2(raw,
                     "SELECT schema_version, length(database_identity) FROM premise_config WHERE id = 1",
                     -1, &statement, nullptr) == SQLITE_OK,
                     "could not inspect premise configuration");
             require(sqlite3_step(statement) == SQLITE_ROW &&
-                    sqlite3_column_int(statement, 0) == 3 && sqlite3_column_int(statement, 1) == 16,
+                    sqlite3_column_int(statement, 0) == 4 && sqlite3_column_int(statement, 1) == 16,
                     "premise database identity or schema version is invalid");
             sqlite3_finalize(statement);
             sqlite3_close_v2(raw);
@@ -225,15 +220,14 @@ int main() {
 
         {
             PremiseIndex index;
-            index.open(stale_path.string(), 2, 1);
+            index.open(stale_path.string(), 2);
             index.replace_module("Stale", "v1", {}, {
                 candidate("Stale.old", 1.0f, 0.0f),
             });
-            index.wait_for_rebuild_for_test();
         }
         {
             PremiseIndex index;
-            index.open(stale_path.string(), 2, 10000);
+            index.open(stale_path.string(), 2);
             require(index.loaded_sidecar_for_test(), "current sidecar was not loaded before replacement");
             index.replace_module("Stale", "v2", {}, {
                 candidate("Stale.new", 0.0f, 1.0f),
@@ -241,20 +235,19 @@ int main() {
         }
         {
             PremiseIndex index;
-            index.open(stale_path.string(), 2, 10000);
+            index.open(stale_path.string(), 2);
             require(index.loaded_sidecar_for_test(), "stale sidecar was not loaded");
             const auto hits = index.search_global(query_y, 8);
             require(hits.size() == 1 && has_hit(hits, "Stale.new") && !has_hit(hits, "Stale.old"),
-                    "stale sidecar reconciliation returned replaced declarations");
+                    "inactive sidecar IDs returned replaced declarations");
         }
 
         {
             PremiseIndex index;
-            index.open(corrupt_path.string(), 2, 1);
+            index.open(corrupt_path.string(), 2);
             index.replace_module("Corrupt", "v1", {}, {
                 candidate("Corrupt.row", 1.0f, 0.0f),
             });
-            index.wait_for_rebuild_for_test();
         }
         {
             std::ofstream corrupt(corrupt_path.string() + ".faiss", std::ios::binary | std::ios::trunc);
@@ -262,62 +255,104 @@ int main() {
             require((bool) corrupt, "could not corrupt FAISS sidecar");
         }
         {
-            PremiseIndex index;
-            index.open(corrupt_path.string(), 2, 10000);
-            require(!index.loaded_sidecar_for_test(), "corrupt sidecar was accepted");
-            const auto hits = index.search_global(query_x, 1);
-            require(hits.size() == 1 && hits[0].name == "Corrupt.row",
-                    "SQLite fallback lost rows after sidecar corruption");
-        }
-        {
-            PremiseIndex index;
-            index.open(corrupt_path.string(), 2, 10000);
-            require(index.loaded_sidecar_for_test(), "corrupt sidecar was not replaced");
+            bool rejected = false;
+            try {
+                PremiseIndex index;
+                index.open(corrupt_path.string(), 2);
+            } catch (const std::exception &) {
+                rejected = true;
+            }
+            require(rejected, "corrupt sidecar was accepted without its FAISS vectors");
         }
 
         {
             PremiseIndex index;
-            index.open(identity_a_path.string(), 2, 1);
+            index.open(identity_a_path.string(), 2);
             index.replace_module("IdentityA", "v1", {}, {
                 candidate("IdentityA.row", 1.0f, 0.0f),
             });
-            index.wait_for_rebuild_for_test();
         }
         {
             PremiseIndex index;
-            index.open(identity_b_path.string(), 2, 1);
+            index.open(identity_b_path.string(), 2);
             index.replace_module("IdentityB", "v1", {}, {
                 candidate("IdentityB.row", 0.0f, 1.0f),
             });
-            index.wait_for_rebuild_for_test();
         }
         std::filesystem::copy_file(identity_a_path.string() + ".faiss",
                 identity_b_path.string() + ".faiss", std::filesystem::copy_options::overwrite_existing);
         {
-            PremiseIndex index;
-            index.open(identity_b_path.string(), 2, 10000);
-            require(!index.loaded_sidecar_for_test(), "sidecar from another database was accepted");
-            const auto hits = index.search_global(query_y, 2);
-            require(hits.size() == 1 && hits[0].name == "IdentityB.row",
-                    "database identity fallback returned foreign rows");
-        }
-        {
-            PremiseIndex index;
-            index.open(identity_b_path.string(), 2, 10000);
-            require(index.loaded_sidecar_for_test(), "wrong-identity sidecar was not replaced");
+            bool rejected = false;
+            try {
+                PremiseIndex index;
+                index.open(identity_b_path.string(), 2);
+            } catch (const std::exception &) {
+                rejected = true;
+            }
+            require(rejected, "sidecar from another database was accepted");
         }
 
         {
             PremiseIndex index;
-            index.open(worker_path.string(), 2, 2);
+            index.open(rollback_path.string(), 2);
+            index.replace_module("Rollback", "v1", {}, {
+                candidate("Rollback.old", 1.0f, 0.0f),
+            });
+        }
+        std::filesystem::copy_file(rollback_path, rollback_snapshot_path,
+                std::filesystem::copy_options::overwrite_existing);
+        {
+            PremiseIndex index;
+            index.open(rollback_path.string(), 2);
+            index.replace_module("Rollback", "v2", {}, {
+                candidate("Rollback.new", 0.0f, 1.0f),
+            });
+        }
+        std::remove((rollback_path.string() + "-shm").c_str());
+        std::remove((rollback_path.string() + "-wal").c_str());
+        std::filesystem::copy_file(rollback_snapshot_path, rollback_path,
+                std::filesystem::copy_options::overwrite_existing);
+        {
+            PremiseIndex index;
+            index.open(rollback_path.string(), 2);
+            require(index.get_module_version("Rollback") == "v1",
+                    "pre-commit SQLite state did not remain active");
+            auto hits = index.search_global(query_x, 2);
+            require(hits.size() == 1 && hits[0].name == "Rollback.old",
+                    "inactive preflushed FAISS ID changed the committed state");
+            index.replace_module("Rollback", "v2-retry", {}, {
+                candidate("Rollback.retry", 0.0f, 1.0f),
+            });
+            hits = index.search_global(query_y, 2);
+            require(hits.size() == 1 && hits[0].name == "Rollback.retry",
+                    "FAISS ID allocator reused an orphaned ID");
+        }
+        {
+            sqlite3 * raw = nullptr;
+            require(sqlite3_open_v2(rollback_path.string().c_str(), &raw,
+                    SQLITE_OPEN_READONLY, nullptr) == SQLITE_OK,
+                    "could not inspect rollback database");
+            sqlite3_stmt * statement = nullptr;
+            require(sqlite3_prepare_v2(raw,
+                    "SELECT id FROM premise_declarations WHERE module = 'Rollback'",
+                    -1, &statement, nullptr) == SQLITE_OK,
+                    "could not inspect retry FAISS ID");
+            require(sqlite3_step(statement) == SQLITE_ROW && sqlite3_column_int64(statement, 0) == 3,
+                    "FAISS ID allocator reused an orphaned ID");
+            sqlite3_finalize(statement);
+            sqlite3_close_v2(raw);
+        }
+
+        {
+            PremiseIndex index;
+            index.open(worker_path.string(), 2);
             index.replace_module("Base", "v1", {}, {
                 candidate("Base.x", 1.0f, 0.0f),
                 candidate("Base.y", 0.0f, 1.0f),
             });
-            index.wait_for_rebuild_for_test();
             auto hits = index.search_global(query_x, 2);
             require(hits.size() == 2 && has_hit(hits, "Base.x"),
-                    "low-threshold background rebuild lost declarations");
+                    "FAISS-first write lost declarations");
 
             index.replace_module("Base", "v2", {}, {
                 candidate("Base.new", 0.0f, 1.0f),
@@ -325,24 +360,23 @@ int main() {
             index.replace_module("Tail", "v1", {}, {
                 candidate("Tail.row", 1.0f, 0.0f),
             });
-            index.wait_for_rebuild_for_test();
             hits = index.search_global(query_x, 4);
             require(hits.size() == 2 && has_hit(hits, "Base.new") && has_hit(hits, "Tail.row"),
-                    "replacement did not remove rebuilt base IDs immediately");
+                    "replacement did not remove inactive IDs immediately");
         }
 
         {
             PremiseIndex index;
-            index.open(worker_path.string(), 2, 10000);
-            require(index.loaded_sidecar_for_test(), "background rebuild did not update the sidecar");
+            index.open(worker_path.string(), 2);
+            require(index.loaded_sidecar_for_test(), "replacement did not update the sidecar");
             const auto hits = index.search_global(query_x, 4);
             require(hits.size() == 2 && has_hit(hits, "Base.new") && has_hit(hits, "Tail.row"),
-                    "background sidecar did not preserve current rows");
+                    "durable sidecar did not preserve current rows");
         }
 
         {
             PremiseIndex index;
-            index.open(worker_path.string(), 2, 1);
+            index.open(worker_path.string(), 2);
             std::vector<PremiseIndex::Candidate> pending;
             pending.reserve(2000);
             for (int i = 0; i < 2000; ++i) {
@@ -382,6 +416,8 @@ int main() {
         remove_database(corrupt_path);
         remove_database(identity_a_path);
         remove_database(identity_b_path);
+        remove_database(rollback_path);
+        remove_database(rollback_snapshot_path);
         remove_database(v1_path);
         return 1;
     }
@@ -392,6 +428,8 @@ int main() {
     remove_database(corrupt_path);
     remove_database(identity_a_path);
     remove_database(identity_b_path);
+    remove_database(rollback_path);
+    remove_database(rollback_snapshot_path);
     remove_database(v1_path);
     return 0;
 }

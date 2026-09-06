@@ -2,7 +2,7 @@
 
 namespace premise_schema {
 
-inline constexpr int VERSION = 3;
+inline constexpr int VERSION = 4;
 
 inline constexpr const char * SQL = R"sql(
 CREATE TABLE IF NOT EXISTS premise_config(
@@ -32,11 +32,6 @@ CREATE TABLE IF NOT EXISTS premise_declarations(
 );
 CREATE INDEX IF NOT EXISTS premise_declarations_module
     ON premise_declarations(module, ordinal);
-CREATE TABLE IF NOT EXISTS premise_declaration_embeddings(
-    declaration_id INTEGER PRIMARY KEY
-        REFERENCES premise_declarations(id) ON DELETE CASCADE,
-    embedding BLOB NOT NULL
-);
 )sql";
 
 } // namespace premise_schema
