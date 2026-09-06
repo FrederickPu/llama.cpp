@@ -836,7 +836,7 @@ private:
 #if defined(_WIN32)
         if (_commit(_fileno(file)) != 0) {
 #else
-        if (fsync(fileno(file)) != 0) {
+        if (::fsync(::fileno(file)) != 0) {
 #endif
             throw std::runtime_error("cannot sync premise FAISS sidecar");
         }
@@ -859,14 +859,14 @@ private:
 #ifdef O_DIRECTORY
         flags |= O_DIRECTORY;
 #endif
-        const int directory_fd = open(directory.c_str(), flags);
-        if (directory_fd < 0 || fsync(directory_fd) != 0) {
+        const int directory_fd = ::open(directory.c_str(), flags);
+        if (directory_fd < 0 || ::fsync(directory_fd) != 0) {
             if (directory_fd >= 0) {
-                close(directory_fd);
+                ::close(directory_fd);
             }
             throw std::runtime_error("cannot sync premise FAISS sidecar directory");
         }
-        close(directory_fd);
+        ::close(directory_fd);
 #endif
     }
 
