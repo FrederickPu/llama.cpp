@@ -40,7 +40,6 @@ struct PremiseIndex {
 
     struct ModuleEntry {
         std::string version_token;
-        std::vector<std::string> imports;
         std::vector<faiss::idx_t> declaration_ids;
     };
 
@@ -160,7 +159,6 @@ struct PremiseIndex {
 
     void replace_module(const std::string & module,
                         const std::string & version_token,
-                        const std::vector<std::string> & imports,
                         const std::vector<Candidate> & replacements) {
         std::lock_guard<std::mutex> lock(mu);
         require_db();
@@ -198,16 +196,6 @@ struct PremiseIndex {
                 insert_module.bind_text(1, module);
                 insert_module.bind_text(2, version_token);
                 insert_module.run();
-
-                Statement insert_import(db,
-                        "INSERT INTO premise_imports(module, ordinal, imported_module) VALUES(?1, ?2, ?3)");
-                for (size_t i = 0; i < imports.size(); ++i) {
-                    insert_import.bind_text(1, module);
-                    insert_import.bind_int64(2, checked_int64(i, "too many module imports"));
-                    insert_import.bind_text(3, imports[i]);
-                    insert_import.run();
-                    insert_import.reset();
-                }
 
                 Statement insert_declaration(db,
                         "INSERT INTO premise_declarations(module, ordinal, name) VALUES(?1, ?2, ?3)");
@@ -252,7 +240,7 @@ struct PremiseIndex {
         }
 
         try {
-            apply_committed_replacement_locked(module, version_token, imports, accepted, new_ids);
+            apply_committed_replacement_locked(module, version_token, accepted, new_ids);
         } catch (...) {
             refresh_database_locked(true);
         }
@@ -273,7 +261,7 @@ struct PremiseIndex {
     }
 
     std::vector<Hit> search_scoped(const float * query,
-                                   const std::vector<std::string> & import_roots,
+                                   const std::vector<std::string> & selected_modules,
                                    const std::vector<Candidate> & locals,
                                    int top_k) const {
         std::lock_guard<std::mutex> lock(mu);
@@ -284,13 +272,12 @@ struct PremiseIndex {
         }
         validate_vector(query, dim, "query embedding");
 
-        if (scope_cache.revision != content_revision || scope_cache.import_roots != import_roots) {
+        if (scope_cache.revision != content_revision || scope_cache.modules != selected_modules) {
             scope_cache = {};
             scope_cache.revision = content_revision;
-            scope_cache.import_roots = import_roots;
-            std::unordered_set<std::string> visited;
-            for (const auto & root : import_roots) {
-                collect_candidate_rows(root, visited, scope_cache.names, scope_cache.ids);
+            scope_cache.modules = selected_modules;
+            for (const auto & module : selected_modules) {
+                collect_module_rows(module, scope_cache.names, scope_cache.ids);
             }
         }
 
@@ -322,7 +309,7 @@ private:
 
     struct ScopeCache {
         int64_t revision = -1;
-        std::vector<std::string> import_roots;
+        std::vector<std::string> modules;
         std::vector<faiss::idx_t> ids;
         std::unordered_set<std::string> names;
     };
@@ -572,20 +559,9 @@ private:
         while (read_modules.step()) {
             const std::string module = column_text(read_modules.stmt, 0);
             const std::string token = column_text(read_modules.stmt, 1);
-            if (!state.modules.emplace(module, ModuleEntry{token, {}, {}}).second) {
+            if (!state.modules.emplace(module, ModuleEntry{token, {}}).second) {
                 throw std::runtime_error("duplicate module metadata in premise database");
             }
-        }
-
-        Statement read_imports(database,
-                "SELECT module, imported_module FROM premise_imports ORDER BY module, ordinal");
-        while (read_imports.step()) {
-            const std::string module = column_text(read_imports.stmt, 0);
-            auto it = state.modules.find(module);
-            if (it == state.modules.end()) {
-                throw std::runtime_error("premise import references an unknown module");
-            }
-            it->second.imports.push_back(column_text(read_imports.stmt, 1));
         }
 
         Statement read_declarations(database,
@@ -714,7 +690,6 @@ private:
     void apply_committed_replacement_locked(
             const std::string & module,
             const std::string & version_token,
-            const std::vector<std::string> & imports,
             const std::vector<const Candidate *> & accepted,
             const std::vector<faiss::idx_t> & new_ids) {
         std::vector<faiss::idx_t> old_ids;
@@ -744,7 +719,6 @@ private:
 
         ModuleEntry & entry = modules[module];
         entry.version_token = version_token;
-        entry.imports = imports;
         entry.declaration_ids = new_ids;
         if (!new_ids.empty()) {
             std::vector<float> embeddings;
@@ -841,20 +815,13 @@ private:
         }
     }
 
-    void collect_candidate_rows(
+    void collect_module_rows(
             const std::string & module,
-            std::unordered_set<std::string> & visited,
             std::unordered_set<std::string> & taken_names,
             std::vector<faiss::idx_t> & candidate_rows) const {
-        if (!visited.insert(module).second) {
-            return;
-        }
         auto it = modules.find(module);
         if (it == modules.end()) {
             return;
-        }
-        for (const auto & imported : it->second.imports) {
-            collect_candidate_rows(imported, visited, taken_names, candidate_rows);
         }
         for (faiss::idx_t id : it->second.declaration_ids) {
             auto row = rows.find(id);

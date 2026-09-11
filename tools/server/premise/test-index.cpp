@@ -78,11 +78,11 @@ int main() {
             require(index.find_local_embedding("local declaration", local_embedding) &&
                     local_embedding == std::vector<float>({1.0f, 0.0f}),
                     "local embedding cache update failed");
-            index.replace_module("A", "a1", {}, {
+            index.replace_module("A", "a1", {
                 candidate("A.x", 1.0f, 0.0f),
                 candidate("A.y", 0.0f, 1.0f),
             });
-            index.replace_module("B", "b1", {"A"}, {
+            index.replace_module("B", "b1", {
                 candidate("A.x", 0.0f, 1.0f),
                 candidate("B.z", -1.0f, 0.0f),
             });
@@ -97,11 +97,11 @@ int main() {
             require(global.size() == 1 && global[0].name == "A.x", "FAISS KNN result mismatch");
             require(std::fabs(global[0].score - 1.0f) < 1e-5f, "FAISS KNN score mismatch");
 
-            auto scoped = index.search_scoped(query_y, {"B"}, {}, 8);
+            auto scoped = index.search_scoped(query_y, {"A", "B"}, {}, 8);
             require(scoped.size() == 3, "scoped search did not apply name shadowing");
             require(scoped[0].name == "A.y", "scoped KNN ranking mismatch");
 
-            index.replace_module("A", "a2", {}, {
+            index.replace_module("A", "a2", {
                 candidate("A.new", -1.0f, 0.0f),
             });
             require(index.size() == 3, "module replacement left stale rows");
@@ -109,12 +109,12 @@ int main() {
             global = index.search_global(query_x, 8);
             require(!has_hit(global, "A.y"), "deleted declaration remained searchable");
 
-            scoped = index.search_scoped(query_y, {"B"}, {}, 8);
+            scoped = index.search_scoped(query_y, {"A", "B"}, {}, 8);
             require(scoped.size() == 3, "replacement produced an invalid scoped result set");
             require(scoped[0].name == "A.x", "replacement did not update shadowing");
 
             try {
-                index.replace_module("A", "broken", {}, {
+                index.replace_module("A", "broken", {
                     candidate("bad", std::numeric_limits<float>::quiet_NaN(), 0.0f),
                 });
                 require(false, "invalid vector replacement unexpectedly succeeded");
@@ -135,7 +135,7 @@ int main() {
             auto global = index.search_global(query_y, 3);
             require(global.size() == 3 && has_hit(global, "A.x"), "rebuilt index results changed");
 
-            index.replace_module("Delta", "d1", {}, {
+            index.replace_module("Delta", "d1", {
                 candidate("Delta.diagonal", 0.6f, 0.8f),
             });
             global = index.search_global(query_y, 2);
@@ -147,7 +147,7 @@ int main() {
             {
                 PremiseIndex writer;
                 writer.open(path.string(), 2);
-                writer.replace_module(nul_module, nul_token, {}, {
+                writer.replace_module(nul_module, nul_token, {
                     candidate(std::string("n\0d", 3), 0.0f, 1.0f),
                 });
             }
@@ -158,7 +158,7 @@ int main() {
                     "embedded NUL metadata was not preserved");
 
             const std::string injection = "X'); DROP TABLE premise_modules; --";
-            index.replace_module(injection, injection, {injection}, {
+            index.replace_module(injection, injection, {
                 candidate(injection, 1.0f, 0.0f),
             });
             require(index.get_module_version(injection) == injection,
@@ -171,7 +171,7 @@ int main() {
             for (int i = 0; i < 4100; ++i) {
                 bulk.push_back(candidate("Bulk." + std::to_string(i), 1.0f, 0.0f));
             }
-            index.replace_module("Bulk", "bulk1", {}, bulk);
+            index.replace_module("Bulk", "bulk1", bulk);
             auto large = index.search_scoped(query_x, {"Bulk"}, {}, 4097);
             require(large.size() == 4097, "large scoped KNN query was truncated");
         }
@@ -213,7 +213,7 @@ int main() {
                     -1, &statement, nullptr) == SQLITE_OK,
                     "could not inspect premise configuration");
             require(sqlite3_step(statement) == SQLITE_ROW &&
-                    sqlite3_column_int(statement, 0) == 5,
+                    sqlite3_column_int(statement, 0) == premise_schema::VERSION,
                     "premise database schema version is invalid");
             sqlite3_finalize(statement);
             sqlite3_close_v2(raw);
@@ -222,14 +222,14 @@ int main() {
         {
             PremiseIndex index;
             index.open(stale_path.string(), 2);
-            index.replace_module("Stale", "v1", {}, {
+            index.replace_module("Stale", "v1", {
                 candidate("Stale.old", 1.0f, 0.0f),
             });
         }
         {
             PremiseIndex index;
             index.open(stale_path.string(), 2);
-            index.replace_module("Stale", "v2", {}, {
+            index.replace_module("Stale", "v2", {
                 candidate("Stale.new", 0.0f, 1.0f),
             });
         }
@@ -244,7 +244,7 @@ int main() {
         {
             PremiseIndex index;
             index.open(corrupt_path.string(), 2);
-            index.replace_module("Corrupt", "v1", {}, {
+            index.replace_module("Corrupt", "v1", {
                 candidate("Corrupt.row", 1.0f, 0.0f),
             });
         }
@@ -271,7 +271,7 @@ int main() {
         {
             PremiseIndex index;
             index.open(worker_path.string(), 2);
-            index.replace_module("Base", "v1", {}, {
+            index.replace_module("Base", "v1", {
                 candidate("Base.x", 1.0f, 0.0f),
                 candidate("Base.y", 0.0f, 1.0f),
             });
@@ -279,10 +279,10 @@ int main() {
             require(hits.size() == 2 && has_hit(hits, "Base.x"),
                     "SQLite-first write lost declarations");
 
-            index.replace_module("Base", "v2", {}, {
+            index.replace_module("Base", "v2", {
                 candidate("Base.new", 0.0f, 1.0f),
             });
-            index.replace_module("Tail", "v1", {}, {
+            index.replace_module("Tail", "v1", {
                 candidate("Tail.row", 1.0f, 0.0f),
             });
             hits = index.search_global(query_x, 4);
@@ -306,8 +306,8 @@ int main() {
             for (int i = 0; i < 2000; ++i) {
                 pending.push_back(candidate("Pending." + std::to_string(i), 1.0f, 0.0f));
             }
-            index.replace_module("Pending", "v1", {}, pending);
-            index.replace_module("Pending", "v2", {}, {
+            index.replace_module("Pending", "v1", pending);
+            index.replace_module("Pending", "v2", {
                 candidate("Pending.current", 0.0f, 1.0f),
             });
         }

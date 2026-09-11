@@ -40,7 +40,7 @@ struct LocalDecl {
 struct SelectParams {
     int top_k = 0;
     bool use_scoped_search = false;
-    std::vector<std::string> imports;
+    std::vector<std::string> modules;
     std::vector<LocalDecl> local_decls;
 };
 
@@ -342,9 +342,9 @@ static std::vector<PremiseIndex::Candidate> embed_declarations(
 static SelectParams select_params_from_json(const json & data, int top_k) {
     SelectParams params;
     params.top_k = top_k;
-    params.imports = json_string_array(data, "imports");
+    params.modules = json_string_array(data, "modules");
     params.local_decls = json_local_decls(data);
-    params.use_scoped_search = data.contains("imports") || data.contains("declarations");
+    params.use_scoped_search = data.contains("modules") || data.contains("declarations");
     return params;
 }
 
@@ -357,7 +357,7 @@ static std::vector<PremiseIndex::Hit> select_hits(
     if (params.use_scoped_search) {
         auto locals = embed_declarations(params.local_decls, "", true);
         return g_premise->index->search_scoped(
-                query.data(), params.imports, locals, params.top_k);
+                query.data(), params.modules, locals, params.top_k);
     }
     return g_premise->index->search_global(query.data(), params.top_k);
 }
@@ -426,7 +426,7 @@ static json handle_cache(const json & body) {
     const double embed_ms = ms_since(t_embed_start);
 
     const auto t_replace_start = std::chrono::steady_clock::now();
-    g_premise->index->replace_module(module, token, json_string_array(body, "imports"), candidates);
+    g_premise->index->replace_module(module, token, candidates);
     const double replace_ms = ms_since(t_replace_start);
 
     LOG_INF("%s: module '%s': %zu decls, embed %.2f ms, replace_module %.2f ms\n",
@@ -441,7 +441,7 @@ static json handle_cache(const json & body) {
     };
 }
 
-// /select { goal, k, imports?, declarations? } -> [{name,score}, ...]
+// /select { goal, k, modules?, declarations? } -> [{name,score}, ...]
 static json handle_select(const json & body) {
     if (!g_premise) {
         throw std::runtime_error("premise not initialized");

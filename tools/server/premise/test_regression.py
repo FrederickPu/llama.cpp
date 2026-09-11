@@ -7,7 +7,7 @@ premises. It does not generate text. The intended flow is:
   1. Start: llama-server --premise --model ... --index-db ...
   2. Ask /version which Lean modules are already cached.
   3. Send that module's declarations to /cache when the version token is missing or stale.
-  4. Call /select with imports, local declarations, a goal, and k.
+  4. Call /select with the flattened module list, local declarations, a goal, and k.
 
 Run with --print-guide to see the equivalent manual commands and JSON bodies.
 """
@@ -235,7 +235,6 @@ def cache_timing(result: dict) -> str:
 def cache_body() -> dict:
     return {
         "module": DEMO_MODULE,
-        "imports": [],
         "declarations": DEMO_DECLARATIONS,
         "token": DEMO_TOKEN,
     }
@@ -243,7 +242,7 @@ def cache_body() -> dict:
 
 def select_body(k: int = 2) -> dict:
     return {
-        "imports": [DEMO_MODULE],
+        "modules": [DEMO_MODULE],
         "declarations": [],
         "goal": DEMO_GOAL,
         "k": k,
@@ -290,7 +289,7 @@ def run_tests(args: argparse.Namespace) -> bool:
 
     print("5. Reusing an unchanged local declaration embedding", flush=True)
     local_request = {
-        "imports": [DEMO_MODULE], "declarations": [LOCAL_DECLARATION], "goal": DEMO_GOAL, "k": 3,
+        "modules": [DEMO_MODULE], "declarations": [LOCAL_DECLARATION], "goal": DEMO_GOAL, "k": 3,
     }
     local_first = post_json("/select", local_request)
     local_cached = post_json("/select", local_request)
@@ -306,7 +305,6 @@ def run_tests(args: argparse.Namespace) -> bool:
     if not cache_ok(post_json("/cache", {
         "module": TAIL_MODULE,
         "token": TAIL_TOKEN,
-        "imports": [],
         "declarations": [TAIL_DECLARATION],
     })):
         print("[FAIL] could not cache tail module", file=sys.stderr)
@@ -314,17 +312,16 @@ def run_tests(args: argparse.Namespace) -> bool:
     if not cache_ok(post_json("/cache", {
         "module": DEMO_MODULE,
         "token": REFRESH_TOKEN,
-        "imports": [],
         "declarations": [REFRESH_DECLARATION],
     })):
         print("[FAIL] could not refresh first module", file=sys.stderr)
         return False
 
     refreshed = post_json("/select", {
-        "imports": [DEMO_MODULE], "declarations": [], "goal": "|- True", "k": 8,
+        "modules": [DEMO_MODULE], "declarations": [], "goal": "|- True", "k": 8,
     })
     tail = post_json("/select", {
-        "imports": [TAIL_MODULE], "declarations": [], "goal": "|- True", "k": 8,
+        "modules": [TAIL_MODULE], "declarations": [], "goal": "|- True", "k": 8,
     })
     if [item["name"] for item in refreshed] != [REFRESH_DECLARATION["name"]]:
         print(f"[FAIL] refreshed module still has stale rows: {refreshed!r}", file=sys.stderr)
@@ -418,7 +415,7 @@ API
 
 4. Select premises for a goal.
 
-   The imports list names modules that were populated by /cache. The
+   The modules list is the flattened import closure populated by /cache. The
    declarations field is for local, one-off candidates that should be considered
    for this request but not stored as a module cache entry.
 

@@ -2,7 +2,7 @@
 
 namespace premise_schema {
 
-inline constexpr int VERSION = 5;
+inline constexpr int VERSION = 6;
 
 inline constexpr const char * SQL = R"sql(
 CREATE TABLE IF NOT EXISTS premise_config(
@@ -15,12 +15,6 @@ CREATE TABLE IF NOT EXISTS premise_modules(
     module TEXT PRIMARY KEY,
     version_token TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS premise_imports(
-    module TEXT NOT NULL REFERENCES premise_modules(module) ON DELETE CASCADE,
-    ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
-    imported_module TEXT NOT NULL,
-    PRIMARY KEY(module, ordinal)
-) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS premise_declarations(
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     module TEXT NOT NULL REFERENCES premise_modules(module) ON DELETE CASCADE,
