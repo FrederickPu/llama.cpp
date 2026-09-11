@@ -2,15 +2,14 @@
 
 namespace premise_schema {
 
-inline constexpr int VERSION = 4;
+inline constexpr int VERSION = 5;
 
 inline constexpr const char * SQL = R"sql(
 CREATE TABLE IF NOT EXISTS premise_config(
     id INTEGER PRIMARY KEY CHECK(id = 1),
     schema_version INTEGER NOT NULL,
     embedding_dim INTEGER NOT NULL,
-    content_revision INTEGER NOT NULL DEFAULT 0,
-    database_identity BLOB NOT NULL CHECK(length(database_identity) = 16)
+    content_revision INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS premise_modules(
     module TEXT PRIMARY KEY,
@@ -32,6 +31,11 @@ CREATE TABLE IF NOT EXISTS premise_declarations(
 );
 CREATE INDEX IF NOT EXISTS premise_declarations_module
     ON premise_declarations(module, ordinal);
+CREATE TABLE IF NOT EXISTS premise_declaration_embeddings(
+    declaration_id INTEGER PRIMARY KEY
+        REFERENCES premise_declarations(id) ON DELETE CASCADE,
+    embedding BLOB NOT NULL
+);
 )sql";
 
 } // namespace premise_schema

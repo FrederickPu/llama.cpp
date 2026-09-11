@@ -8,7 +8,7 @@ struct server_http_context;
 // Premise mode entry point (llama-server --premise).
 int premise_server(int argc, char ** argv);
 
-// After model load: one embedding context + SQLite metadata and FAISS vectors.
+// After model load: one embedding context + SQLite persistence and in-memory FAISS.
 bool premise_setup(server_context & ctx_server, const std::string & database_path);
 void premise_cleanup();
 

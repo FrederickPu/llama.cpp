@@ -371,9 +371,9 @@ Build
 Start
 -----
 
-The cache uses SQLite for module/declaration metadata and a .faiss sidecar for
-the embedding vectors:
-  --index-db : SQLite metadata database; vectors are stored in FILE.faiss
+The cache uses SQLite for module, declaration, and embedding data. FAISS is
+rebuilt in memory when the server starts:
+  --index-db : SQLite premise database
 Pretty-printed declaration strings are sent by Lean only to compute embeddings;
 they are not stored in the database.
 
@@ -435,8 +435,8 @@ Notes
 -----
 
   - /version reads module freshness metadata loaded from --index-db and survives restart.
-  - /cache flushes FAISS before transactionally replacing the module metadata.
-    Declaration strings are not persisted.
+  - /cache transactionally replaces the module metadata and embedding vectors.
+    Declaration strings are not persisted; FAISS remains in memory.
   - Lean decides which declarations belong to each module and sends fully
     qualified names through /cache; the server does not infer module membership.
   - /version accepts multiple modules and returns aligned tokens; /cache remains one module per request.

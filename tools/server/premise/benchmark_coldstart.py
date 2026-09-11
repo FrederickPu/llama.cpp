@@ -223,7 +223,6 @@ def main() -> int:
             "suggestion_names": [suggestion["name"] for suggestion in suggestions],
             "shutdown_and_total_seconds": round(total_seconds, 3),
             "database_bytes": file_size(args.index_db),
-            "faiss_sidecar_bytes": file_size(Path(str(args.index_db) + ".faiss")),
         }
         print(json.dumps(summary, indent=2))
     return 0
