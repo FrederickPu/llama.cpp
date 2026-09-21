@@ -20,6 +20,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 import urllib.error
@@ -210,13 +211,19 @@ class ManagedPremiseServer:
             self.log_file.close()
 
 
-def post_json(path: str, body: dict, timeout: int = 120):
+def post_json(path: str, body: dict, timeout: int = 120, *, method: str = "POST"):
     request = urllib.request.Request(
         f"{BASE_URL}{path}",
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json"},
+        method=method,
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def get_json(path: str, timeout: int = 120):
+    with urllib.request.urlopen(f"{BASE_URL}{path}", timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -253,8 +260,14 @@ def dump_json(data: dict) -> str:
     return json.dumps(data, indent=2, ensure_ascii=False)
 
 
-def run_tests(args: argparse.Namespace) -> bool:
+def run_tests(args: argparse.Namespace, alternate_database: str | None = None) -> bool:
     print(f"Using premise mode at {BASE_URL}", flush=True)
+
+    served = get_json("/index")
+    if not isinstance(served, dict) or not isinstance(served.get("path"), str):
+        print(f"[FAIL] /index did not report the active database: {served!r}", file=sys.stderr)
+        return False
+    original_database = served["path"]
 
     print(f"1. Checking /version for uncached module {DEMO_MODULE!r}", flush=True)
     before_versions = post_json("/version", {"modules": [DEMO_MODULE]})
@@ -333,6 +346,35 @@ def run_tests(args: argparse.Namespace) -> bool:
         print("[FAIL] tail module token changed during first-module refresh", file=sys.stderr)
         return False
 
+    if alternate_database is not None:
+        print("7. Switching databases, reselecting, and rejecting invalid paths", flush=True)
+        for path, token in [
+            (alternate_database, None),
+            (original_database, TAIL_TOKEN),
+            (original_database, TAIL_TOKEN),  # selecting the current path is a no-op
+        ]:
+            result = post_json("/index", {"path": path}, method="PUT")
+            if result != {"ok": True} or get_json("/index") != {"path": path}:
+                print(f"[FAIL] could not select premise database {path!r}: {result!r}", file=sys.stderr)
+                return False
+            if post_json("/version", {"modules": [TAIL_MODULE]}) != [token]:
+                print(f"[FAIL] selected database has incorrect cache: {path!r}", file=sys.stderr)
+                return False
+        missing_parent = str(Path(alternate_database).parent / "missing" / "premise.db")
+        for path in ["", "\0", original_database + "\0suffix", missing_parent]:
+            try:
+                post_json("/index", {"path": path}, method="PUT")
+            except urllib.error.HTTPError as error:
+                if error.code != 400 or "message" not in json.load(error).get("error", {}):
+                    raise
+            else:
+                print(f"[FAIL] accepted invalid database path: {path!r}", file=sys.stderr)
+                return False
+            if (get_json("/index") != {"path": original_database} or
+                    post_json("/version", {"modules": [TAIL_MODULE]}) != [TAIL_TOKEN]):
+                print("[FAIL] failed selection changed the active database", file=sys.stderr)
+                return False
+
     print("premise mode demo OK. Suggestions:", flush=True)
     print(json.dumps(suggestions, indent=2), flush=True)
     return True
@@ -369,8 +411,9 @@ Start
 -----
 
 The cache uses SQLite for module, declaration, and embedding data. FAISS is
-rebuilt in memory when the server starts:
-  --index-db : SQLite premise database
+rebuilt in memory when a database is selected:
+  --index-db : optional initial SQLite premise database
+  PUT /index: select or replace the active database after startup
 Pretty-printed declaration strings are sent by Lean only to compute embeddings;
 they are not stored in the database.
 
@@ -380,6 +423,11 @@ they are not stored in the database.
 
 API
 ---
+
+GET /index returns {{"path":".../premise.db"}}, or {{"path":null}} if none is selected.
+PUT /index with JSON {{"path":"/absolute/path/to/premise.db"}} selects a database
+and returns {{"ok":true}}. The replacement is opened before it becomes active;
+selecting the current path is a no-op.
 
 1. Check which module tokens are already cached in this process.
 
@@ -431,7 +479,7 @@ API
 Notes
 -----
 
-  - /version reads module freshness metadata loaded from --index-db and survives restart.
+  - /version reads module freshness metadata from the active database and survives restart.
   - /cache transactionally replaces the module metadata and embedding vectors.
     Declaration strings are not persisted; FAISS remains in memory.
   - Lean decides which declarations belong to each module and sends fully
@@ -483,8 +531,10 @@ def main() -> int:
         return 0 if run_tests(args) else 1
 
     BASE_URL = f"http://{args.host}:{args.port}"
-    with ManagedPremiseServer(args):
-        return 0 if run_tests(args) else 1
+    BUILD_DIR.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="premise-switch-", dir=BUILD_DIR) as directory:
+        with ManagedPremiseServer(args):
+            return 0 if run_tests(args, str(Path(directory) / "premise.db")) else 1
 
 
 if __name__ == "__main__":

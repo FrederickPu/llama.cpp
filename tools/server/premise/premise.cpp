@@ -47,11 +47,13 @@ struct SelectParams {
 struct PremiseState {
     llama_context * embed_ctx = nullptr;
     std::unique_ptr<PremiseIndex> index;
+    std::string database_path;
     int embed_dim = 0;
     std::mutex embed_mutex;
 };
 
 static PremiseState * g_premise = nullptr;
+static std::mutex g_index_mutex;
 
 // ---------------------------------------------------------------------------
 // JSON / HTTP helpers
@@ -153,16 +155,21 @@ bool premise_setup(server_context & ctx_server, const std::string & database_pat
 
     try {
         const int embed_dim = llama_model_n_embd_out(model);
-        auto index = std::make_unique<PremiseIndex>();
-        index->open(database_path, embed_dim);
+        std::unique_ptr<PremiseIndex> index;
+        if (!database_path.empty()) {
+            index = std::make_unique<PremiseIndex>();
+            index->open(database_path, embed_dim);
+        }
 
         auto state = std::make_unique<PremiseState>();
         state->embed_ctx = embed_ctx;
         state->embed_dim = embed_dim;
         state->index = std::move(index);
+        state->database_path = database_path;
         g_premise = state.release();
 
-        SRV_INF("premise ready: rows=%d\n", (int) g_premise->index->size());
+        SRV_INF("premise ready: path='%s', rows=%d\n", database_path.c_str(),
+                g_premise->index ? (int) g_premise->index->size() : 0);
         return true;
     } catch (const std::exception & e) {
         SRV_ERR("premise init failed: %s\n", e.what());
@@ -363,8 +370,39 @@ static std::vector<PremiseIndex::Hit> select_hits(
 }
 
 // ---------------------------------------------------------------------------
-// HTTP: POST /version, /cache, /select
+// HTTP: GET/PUT /index; POST /version, /cache, /select
 // ---------------------------------------------------------------------------
+
+// GET /index (no body) -> { "path": string | null }
+static json handle_index_status() {
+    if (!g_premise) {
+        throw std::runtime_error("premise not initialized");
+    }
+    std::lock_guard<std::mutex> lock(g_index_mutex);
+    return json{{"path", g_premise->index ? json(g_premise->database_path) : json(nullptr)}};
+}
+
+// PUT /index { "path": string } -> { "ok": true }
+static json handle_index(const json & body) {
+    if (!g_premise) {
+        throw std::runtime_error("premise not initialized");
+    }
+    const std::string path = json_string(body, "path");
+    if (path.empty() || path.find('\0') != std::string::npos) {
+        throw std::runtime_error("missing or invalid path");
+    }
+
+    if (g_premise->index && g_premise->database_path == path) {
+        return json{{"ok", true}};
+    }
+    auto replacement = std::make_unique<PremiseIndex>();
+    replacement->open(path, g_premise->embed_dim);
+    g_premise->database_path = path;
+    g_premise->index = std::move(replacement);
+
+    SRV_INF("serving premise database: path='%s'\n", path.c_str());
+    return json{{"ok", true}};
+}
 
 // /version { "modules": ["..."] } -> [token | null, ...]
 static json handle_version(const json & body) {
@@ -382,6 +420,9 @@ static json handle_version(const json & body) {
     }
     json result = json::array();
     if (!g_premise || !g_premise->index) {
+        for (size_t i = 0; i < modules.size(); ++i) {
+            result.push_back(nullptr);
+        }
         return result;
     }
     for (const auto & token : g_premise->index->get_module_versions(modules)) {
@@ -460,6 +501,7 @@ void premise_register_http_routes(const server_http_context & ctx_http) {
         return [handler](const server_http_req & req) -> server_http_res_ptr {
             try {
                 json body = req.body.empty() ? json::object() : json::parse(req.body);
+                std::lock_guard<std::mutex> lock(g_index_mutex);
                 return make_json_response(handler(body));
             } catch (const std::exception & e) {
                 return make_error_response(e);
@@ -467,6 +509,14 @@ void premise_register_http_routes(const server_http_context & ctx_http) {
         };
     };
 
+    ctx_http.get("/index", [](const server_http_req &) -> server_http_res_ptr {
+        try {
+            return make_json_response(handle_index_status());
+        } catch (const std::exception & e) {
+            return make_error_response(e);
+        }
+    });
+    ctx_http.put("/index",    post_json(handle_index));
     ctx_http.post("/version", post_json(handle_version));
     ctx_http.post("/cache",   post_json(handle_cache));
     ctx_http.post("/select",  post_json(handle_select));
@@ -484,7 +534,7 @@ static void print_premise_usage(int, char **) {
     printf("  --premise\n");
     printf("      run as premise retrieval server instead of generation server\n\n");
     printf("  --index-db FILE\n");
-    printf("      path to the SQLite premise database\n\n");
+    printf("      initial SQLite premise database (optional; can be set with PUT /index)\n\n");
 }
 
 static void premise_signal_handler(int signal) {
@@ -527,11 +577,6 @@ int premise_server(int argc, char ** argv) {
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER, print_premise_usage)) {
         return 1;
     }
-    if (database_path.empty()) {
-        SRV_ERR("%s", "--index-db is required in premise mode\n");
-        return 1;
-    }
-
     // Generation slots unused; one slot is enough for model load.
     if (params.n_parallel < 0) {
         params.n_parallel = 1;
