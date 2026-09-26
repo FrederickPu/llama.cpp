@@ -16,21 +16,16 @@ name: Premise Release
 #   llama-<tag>-bin-win-cuda-13.3-x64.zip
 #   llama-<tag>-bin-win-cpu-arm64.zip
 #
-# Trigger: any branch push, a premise-* tag, or workflow_dispatch.
+# Branch pushes and workflow_dispatch build Actions artifacts.
+# Publishing a premise-* release builds and attaches its tagged binaries.
 
 on:
   workflow_dispatch:
-    inputs:
-      create_release:
-        description: 'Also create a release from this run'
-        required: false
-        default: false
-        type: boolean
   push:
     branches:
       - '**'
-    tags:
-      - 'premise-*'
+  release:
+    types: [published]
 
 permissions:
   contents: read
@@ -44,6 +39,7 @@ concurrency:
 
 jobs:
   tag:
+    if: ${{ github.event_name != 'release' || startsWith(github.event.release.tag_name, 'premise-') }}
     runs-on: ubuntu-latest
     outputs:
       name: ${{ steps.tag.outputs.name }}
@@ -306,7 +302,7 @@ jobs:
 
   release:
     needs: [tag, macos, ubuntu-vulkan, windows-vulkan-x64, windows-cpu-arm64, windows-cuda-x64]
-    if: ${{ github.ref_type == 'tag' || inputs.create_release }}
+    if: ${{ github.event_name == 'release' }}
     permissions:
       contents: write
     runs-on: ubuntu-latest
@@ -317,13 +313,9 @@ jobs:
           path: ./artifact
           merge-multiple: true
 
-      - name: Create release
+      - name: Publish release artifacts
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.tag.outputs.name }}
         run: |
-          gh release create "$TAG" artifact/* \
-            --repo "${{ github.repository }}" \
-            --target "${{ github.sha }}" \
-            --title "$TAG" \
-            --notes "llama-server builds for CanonicalDrafter (PremiseServer=ON; run with llama-server --premise; see tools/server/premise/). Windows CUDA zips bundle cudart."
+          gh release upload "$TAG" artifact/* --repo "${{ github.repository }}" --clobber
