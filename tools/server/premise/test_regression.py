@@ -123,7 +123,6 @@ def premise_server_command(args: argparse.Namespace) -> list[str]:
         "--host", args.host,
         "--port", str(args.port),
         "--model", str(args.model),
-        "--pooling", args.pooling,
         "--ctx-size", str(args.ctx_size),
         "--index-db", str(args.index_db),
     ]
@@ -346,8 +345,24 @@ def run_tests(args: argparse.Namespace, alternate_database: str | None = None) -
         print("[FAIL] tail module token changed during first-module refresh", file=sys.stderr)
         return False
 
+    print("7. Checking pooled embeddings across a packed batch", flush=True)
+    batch_declarations = [
+        {"name": f"Demo.batch_{i}", "decl": DEMO_DECLARATIONS[0]["decl"]} for i in range(64)
+    ]
+    if not cache_ok(post_json("/cache", {
+        "module": DEMO_MODULE, "token": "premise-packed-batch-v1", "declarations": batch_declarations,
+    })):
+        print("[FAIL] could not cache packed declarations", file=sys.stderr)
+        return False
+    packed = post_json("/select", {
+        "goal": DEMO_DECLARATIONS[0]["decl"], "modules": [DEMO_MODULE], "k": len(batch_declarations),
+    })
+    if len(packed) != len(batch_declarations) or any(abs(hit["score"] - 1.0) > 1e-4 for hit in packed):
+        print("[FAIL] packed embeddings differ from the same text embedded alone", file=sys.stderr)
+        return False
+
     if alternate_database is not None:
-        print("7. Switching databases, reselecting, and rejecting invalid paths", flush=True)
+        print("8. Switching databases, reselecting, and rejecting invalid paths", flush=True)
         for path, token in [
             (alternate_database, None),
             (original_database, TAIL_TOKEN),
@@ -418,7 +433,7 @@ Pretty-printed declaration strings are sent by Lean only to compute embeddings;
 they are not stored in the database.
 
    {server_exe} --premise --host {args.host} --port {args.port} --model {args.model} {line_continue}
-       --pooling {args.pooling} --ctx-size {args.ctx_size} {line_continue}
+       --ctx-size {args.ctx_size} {line_continue}
        --index-db {args.index_db}
 
 API
@@ -479,6 +494,8 @@ selecting the current path is a no-op.
 Notes
 -----
 
+  - Pooling defaults to the model metadata. Rebuild caches created without
+    special tokens before using the corrected embeddings.
   - /version reads module freshness metadata from the active database and survives restart.
   - /cache transactionally replaces the module metadata and embedding vectors.
     Declaration strings are not persisted; FAISS remains in memory.
@@ -508,7 +525,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8081)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL, help="GGUF embedding model")
-    parser.add_argument("--pooling", default="mean")
     parser.add_argument("--ctx-size", type=int, default=512)
     parser.add_argument("--index-db", type=Path, default=DEFAULT_INDEX_DB, help="SQLite premise database")
     parser.add_argument("--startup-timeout", type=int, default=180)

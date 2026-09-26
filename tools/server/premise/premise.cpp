@@ -140,12 +140,13 @@ bool premise_setup(server_context & ctx_server, const std::string & database_pat
     llama_context_params embed_params = llama_context_default_params();
     embed_params.n_ctx = n_batch_window;
     embed_params.n_batch = n_batch_window;
-    // Encoder graphs require the full batch; decoder graphs can be split.
-    embed_params.n_ubatch = llama_model_has_encoder(model) ? n_batch_window : 512;
+    embed_params.n_ubatch = n_batch_window;
     embed_params.n_seq_max = (std::min)(256u, (uint32_t) llama_max_parallel_sequences());
     embed_params.embeddings = true;
     embed_params.kv_unified = true;
     embed_params.pooling_type = llama_pooling_type(server_ctx);
+    embed_params.n_threads = llama_n_threads(server_ctx);
+    embed_params.n_threads_batch = llama_n_threads_batch(server_ctx);
 
     llama_context * embed_ctx = llama_init_from_model(model, embed_params);
     if (!embed_ctx) {
@@ -198,11 +199,16 @@ void premise_cleanup() {
 // ---------------------------------------------------------------------------
 
 static std::vector<llama_token> tokenize_for_embed(llama_context * ctx, const std::string & text) {
-    auto tokens = common_tokenize(ctx, text, /*add_special*/ false, /*parse_special*/ true);
+    auto tokens = common_tokenize(ctx, text, /*add_special*/ true, /*parse_special*/ true);
     const int max_tokens = (std::max)(1, (std::min)(
             llama_model_n_ctx_train(llama_get_model(ctx)), (int) llama_n_batch(ctx)));
     if ((int) tokens.size() > max_tokens) {
+        const auto * vocab = llama_model_get_vocab(llama_get_model(ctx));
+        const llama_token last = tokens.back();
         tokens.resize((size_t) max_tokens);
+        if (last == llama_vocab_eos(vocab) || last == llama_vocab_sep(vocab)) {
+            tokens.back() = last;
+        }
     }
     if (tokens.empty()) {
         throw std::runtime_error("tokenization produced no tokens");
