@@ -63,6 +63,9 @@ struct server_context {
     // returns true on success
     bool load_model(common_params & params);
 
+    // drop the loaded model and its context; safe to call more than once
+    void release_model();
+
     // this function will block main thread until termination
     void start_loop();
 

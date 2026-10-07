@@ -14,6 +14,7 @@
 #include <atomic>
 #include <chrono>
 #include <clocale>
+#include <cstdio>
 #include <csignal>
 #include <functional>
 #include <memory>
@@ -48,11 +49,15 @@ struct PremiseState {
     llama_context * embed_ctx = nullptr;
     std::unique_ptr<PremiseIndex> index;
     std::string database_path;
+    std::string model_path;
     int embed_dim = 0;
     std::mutex embed_mutex;
 };
 
 static PremiseState * g_premise = nullptr;
+static server_context * g_ctx_server = nullptr;
+static common_params g_load_params;
+static common_init_result_ptr g_swapped_model;
 static std::mutex g_index_mutex;
 
 // ---------------------------------------------------------------------------
@@ -167,6 +172,7 @@ bool premise_setup(server_context & ctx_server, const std::string & database_pat
         state->embed_dim = embed_dim;
         state->index = std::move(index);
         state->database_path = database_path;
+        state->model_path = g_load_params.model.path;
         g_premise = state.release();
 
         SRV_INF("premise ready: path='%s', rows=%d\n", database_path.c_str(),
@@ -188,6 +194,7 @@ void premise_cleanup() {
     }
     delete g_premise;
     g_premise = nullptr;
+    g_swapped_model.reset();
 }
 
 // ---------------------------------------------------------------------------
@@ -410,6 +417,73 @@ static json handle_index(const json & body) {
     return json{{"ok", true}};
 }
 
+// PUT /model { "path": string } -> { "ok": true }
+static json handle_model(const json & body) {
+    if (!g_premise || !g_premise->embed_ctx) {
+        throw std::runtime_error("premise not initialized");
+    }
+    const std::string path = json_string(body, "path");
+    if (path.empty() || path.find('\0') != std::string::npos) {
+        throw std::runtime_error("missing or invalid path");
+    }
+    if (g_premise->model_path == path) {
+        return json{{"ok", true}};
+    }
+
+    common_params load_params = g_load_params;
+    load_params.model.path = path;
+    load_params.fit_params = false;
+    auto loaded = common_init_from_params(load_params, true);
+    if (!loaded || !loaded->model()) {
+        throw std::runtime_error("failed to load model");
+    }
+    llama_context * like = g_premise->embed_ctx;
+    const uint32_t n_batch_window = 4096;
+    llama_context_params embed_params = llama_context_default_params();
+    embed_params.n_ctx = n_batch_window;
+    embed_params.n_batch = n_batch_window;
+    embed_params.n_ubatch = n_batch_window;
+    embed_params.n_seq_max = (std::min)(256u, (uint32_t) llama_max_parallel_sequences());
+    embed_params.embeddings = true;
+    embed_params.kv_unified = true;
+    embed_params.pooling_type = llama_pooling_type(like);
+    embed_params.n_threads = llama_n_threads(like);
+    embed_params.n_threads_batch = llama_n_threads_batch(like);
+    llama_context * embed_ctx = llama_init_from_model(loaded->model(), embed_params);
+    if (!embed_ctx) {
+        throw std::runtime_error("failed to create embedding context");
+    }
+    if (!g_premise->database_path.empty()) {
+        const std::string db = g_premise->database_path;
+        const int embed_dim = llama_model_n_embd_out(loaded->model());
+        g_premise->index.reset();
+        std::remove(db.c_str());
+        std::remove((db + "-wal").c_str());
+        std::remove((db + "-shm").c_str());
+        try {
+            auto replacement = std::make_unique<PremiseIndex>();
+            replacement->open(db, embed_dim);
+            g_premise->embed_dim = embed_dim;
+            g_premise->index = std::move(replacement);
+        } catch (...) {
+            llama_free(embed_ctx);
+            throw;
+        }
+    }
+
+    std::lock_guard<std::mutex> embed_lock(g_premise->embed_mutex);
+    llama_free(g_premise->embed_ctx);
+    g_premise->embed_ctx = embed_ctx;
+    g_premise->model_path = path;
+    g_swapped_model = std::move(loaded);
+    if (g_ctx_server) {
+        g_ctx_server->release_model();
+        g_ctx_server = nullptr;
+    }
+    SRV_INF("serving premise model: path='%s'\n", path.c_str());
+    return json{{"ok", true}};
+}
+
 // /version { "modules": ["..."] } -> [token | null, ...]
 static json handle_version(const json & body) {
     auto requested = body.find("modules");
@@ -522,7 +596,8 @@ void premise_register_http_routes(const server_http_context & ctx_http) {
             return make_error_response(e);
         }
     });
-    ctx_http.put("/index",    post_json(handle_index));
+    ctx_http.put("/index", post_json(handle_index));
+    ctx_http.put("/model", post_json(handle_model));
     ctx_http.post("/version", post_json(handle_version));
     ctx_http.post("/cache",   post_json(handle_cache));
     ctx_http.post("/select",  post_json(handle_select));
@@ -583,6 +658,7 @@ int premise_server(int argc, char ** argv) {
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER, print_premise_usage)) {
         return 1;
     }
+    g_load_params = params;
     // Generation slots unused; one slot is enough for model load.
     if (params.n_parallel < 0) {
         params.n_parallel = 1;
@@ -594,6 +670,7 @@ int premise_server(int argc, char ** argv) {
     common_params_print_info(params, true);
 
     server_context ctx_server;
+    g_ctx_server = &ctx_server;
     server_http_context ctx_http;
     if (!ctx_http.init(params)) {
         SRV_ERR("%s", "failed to initialize HTTP server\n");

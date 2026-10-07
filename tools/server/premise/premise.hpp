@@ -12,5 +12,5 @@ int premise_server(int argc, char ** argv);
 bool premise_setup(server_context & ctx_server, const std::string & database_path);
 void premise_cleanup();
 
-// HTTP: GET/PUT /index; POST /version, /cache, /select
+// HTTP: GET/PUT /index, PUT /model; POST /version, /cache, /select
 void premise_register_http_routes(const server_http_context & ctx_http);

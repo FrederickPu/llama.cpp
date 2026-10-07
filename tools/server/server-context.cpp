@@ -3666,6 +3666,13 @@ bool server_context::load_model(common_params & params) {
     return impl->load_model(params);
 }
 
+void server_context::release_model() {
+    if (!impl->sleeping) {
+        impl->destroy();
+        impl->sleeping = true;
+    }
+}
+
 void server_context::start_loop() {
     auto & params = impl->params_base;
     impl->queue_tasks.start_loop(params.sleep_idle_seconds * 1000);

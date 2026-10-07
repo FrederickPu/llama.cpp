@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -259,7 +260,7 @@ def dump_json(data: dict) -> str:
     return json.dumps(data, indent=2, ensure_ascii=False)
 
 
-def run_tests(args: argparse.Namespace, alternate_database: str | None = None) -> bool:
+def run_tests(args: argparse.Namespace, alternate_database: str | None = None, model: Path | None = None) -> bool:
     print(f"Using premise mode at {BASE_URL}", flush=True)
 
     served = get_json("/index")
@@ -390,6 +391,39 @@ def run_tests(args: argparse.Namespace, alternate_database: str | None = None) -
                 print("[FAIL] failed selection changed the active database", file=sys.stderr)
                 return False
 
+    if model is not None:
+        print("9. Swapping the model resets the database", flush=True)
+        index_path = get_json("/index")["path"]
+        cached = post_json("/version", {"modules": [TAIL_MODULE]})
+        if post_json("/model", {"path": str(model)}, method="PUT") != {"ok": True}:
+            print("[FAIL] reloading the active model was not a no-op", file=sys.stderr)
+            return False
+        if post_json("/version", {"modules": [TAIL_MODULE]}) != cached:
+            print("[FAIL] same-path model reload cleared the database", file=sys.stderr)
+            return False
+        swapped = model.with_name(model.name + ".swap.gguf")
+        shutil.copyfile(model, swapped)
+        try:
+            if post_json("/model", {"path": str(swapped)}, method="PUT") != {"ok": True}:
+                print("[FAIL] could not swap model", file=sys.stderr)
+                return False
+            if post_json("/version", {"modules": [TAIL_MODULE]}) != [None] or get_json("/index") != {"path": index_path}:
+                print("[FAIL] model swap did not reset the active database", file=sys.stderr)
+                return False
+            try:
+                post_json("/model", {"path": str(swapped) + ".missing"}, method="PUT")
+            except urllib.error.HTTPError as error:
+                if error.code != 400:
+                    raise
+            else:
+                print("[FAIL] accepted a missing model path", file=sys.stderr)
+                return False
+        finally:
+            try:
+                swapped.unlink(missing_ok=True)
+            except OSError:
+                pass
+
     print("premise mode demo OK. Suggestions:", flush=True)
     print(json.dumps(suggestions, indent=2), flush=True)
     return True
@@ -443,6 +477,9 @@ GET /index returns {{"path":".../premise.db"}}, or {{"path":null}} if none is se
 PUT /index with JSON {{"path":"/absolute/path/to/premise.db"}} selects a database
 and returns {{"ok":true}}. The replacement is opened before it becomes active;
 selecting the current path is a no-op.
+PUT /model with JSON {{"path":"/absolute/path/to/model.gguf"}} replaces the active
+embedding model, returns {{"ok":true}}, and resets the active database.
+Selecting the current model path is a no-op.
 
 1. Check which module tokens are already cached in this process.
 
@@ -550,7 +587,7 @@ def main() -> int:
     BUILD_DIR.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="premise-switch-", dir=BUILD_DIR) as directory:
         with ManagedPremiseServer(args):
-            return 0 if run_tests(args, str(Path(directory) / "premise.db")) else 1
+            return 0 if run_tests(args, str(Path(directory) / "premise.db"), args.model) else 1
 
 
 if __name__ == "__main__":
