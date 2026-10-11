@@ -263,11 +263,13 @@ def dump_json(data: dict) -> str:
 def run_tests(args: argparse.Namespace, alternate_database: str | None = None, model: Path | None = None) -> bool:
     print(f"Using premise mode at {BASE_URL}", flush=True)
 
-    served = get_json("/index")
-    if not isinstance(served, dict) or not isinstance(served.get("path"), str):
-        print(f"[FAIL] /index did not report the active database: {served!r}", file=sys.stderr)
+    served = get_json("/config")
+    if (not isinstance(served, dict) or not isinstance(served.get("index"), str) or
+            not isinstance(served.get("model"), str)):
+        print(f"[FAIL] /config did not report the active database and model: {served!r}", file=sys.stderr)
         return False
-    original_database = served["path"]
+    original_database = served["index"]
+    original_model = served["model"]
 
     print(f"1. Checking /version for uncached module {DEMO_MODULE!r}", flush=True)
     before_versions = post_json("/version", {"modules": [DEMO_MODULE]})
@@ -369,54 +371,71 @@ def run_tests(args: argparse.Namespace, alternate_database: str | None = None, m
             (original_database, TAIL_TOKEN),
             (original_database, TAIL_TOKEN),  # selecting the current path is a no-op
         ]:
-            result = post_json("/index", {"path": path}, method="PUT")
-            if result != {"ok": True} or get_json("/index") != {"path": path}:
+            config = {"index": path, "model": original_model}
+            result = post_json("/config", config, method="PUT")
+            if result != {"ok": True} or get_json("/config") != config:
                 print(f"[FAIL] could not select premise database {path!r}: {result!r}", file=sys.stderr)
                 return False
             if post_json("/version", {"modules": [TAIL_MODULE]}) != [token]:
                 print(f"[FAIL] selected database has incorrect cache: {path!r}", file=sys.stderr)
                 return False
+        original_config = {"index": original_database, "model": original_model}
         missing_parent = str(Path(alternate_database).parent / "missing" / "premise.db")
-        for path in ["", "\0", original_database + "\0suffix", missing_parent]:
+        invalid_configs = [
+            {"index": path, "model": original_model}
+            for path in ["", "\0", original_database + "\0suffix", missing_parent]
+        ]
+        invalid_configs += [{"index": original_database}, {"model": original_model}]
+        for config in invalid_configs:
             try:
-                post_json("/index", {"path": path}, method="PUT")
+                post_json("/config", config, method="PUT")
             except urllib.error.HTTPError as error:
                 if error.code != 400 or "message" not in json.load(error).get("error", {}):
                     raise
             else:
-                print(f"[FAIL] accepted invalid database path: {path!r}", file=sys.stderr)
+                print(f"[FAIL] accepted invalid config: {config!r}", file=sys.stderr)
                 return False
-            if (get_json("/index") != {"path": original_database} or
+            if (get_json("/config") != original_config or
                     post_json("/version", {"modules": [TAIL_MODULE]}) != [TAIL_TOKEN]):
-                print("[FAIL] failed selection changed the active database", file=sys.stderr)
+                print("[FAIL] failed selection changed the active config", file=sys.stderr)
                 return False
 
-    if model is not None:
-        print("9. Swapping the model resets the database", flush=True)
-        index_path = get_json("/index")["path"]
-        cached = post_json("/version", {"modules": [TAIL_MODULE]})
-        if post_json("/model", {"path": str(model)}, method="PUT") != {"ok": True}:
-            print("[FAIL] reloading the active model was not a no-op", file=sys.stderr)
-            return False
-        if post_json("/version", {"modules": [TAIL_MODULE]}) != cached:
-            print("[FAIL] same-path model reload cleared the database", file=sys.stderr)
-            return False
+    if model is not None and alternate_database is not None:
+        print("9. Swapping the database and model together", flush=True)
+        original_config = {"index": original_database, "model": original_model}
         swapped = model.with_name(model.name + ".swap.gguf")
         shutil.copyfile(model, swapped)
         try:
-            if post_json("/model", {"path": str(swapped)}, method="PUT") != {"ok": True}:
-                print("[FAIL] could not swap model", file=sys.stderr)
+            swapped_config = {"index": alternate_database, "model": str(swapped)}
+            if (post_json("/config", swapped_config, method="PUT") != {"ok": True} or
+                    get_json("/config") != swapped_config):
+                print("[FAIL] could not swap database and model", file=sys.stderr)
                 return False
-            if post_json("/version", {"modules": [TAIL_MODULE]}) != [None] or get_json("/index") != {"path": index_path}:
-                print("[FAIL] model swap did not reset the active database", file=sys.stderr)
+            if post_json("/version", {"modules": [TAIL_MODULE]}) != [None]:
+                print("[FAIL] swapped database has incorrect cache", file=sys.stderr)
+                return False
+            if not cache_ok(post_json("/cache", {
+                "module": TAIL_MODULE, "token": TAIL_TOKEN, "declarations": [TAIL_DECLARATION],
+            })):
+                print("[FAIL] could not cache with the swapped model", file=sys.stderr)
                 return False
             try:
-                post_json("/model", {"path": str(swapped) + ".missing"}, method="PUT")
+                post_json("/config", {"index": original_database, "model": str(swapped) + ".missing"}, method="PUT")
             except urllib.error.HTTPError as error:
                 if error.code != 400:
                     raise
             else:
                 print("[FAIL] accepted a missing model path", file=sys.stderr)
+                return False
+            if get_json("/config") != swapped_config:
+                print("[FAIL] failed model load changed the active config", file=sys.stderr)
+                return False
+            if (post_json("/config", original_config, method="PUT") != {"ok": True} or
+                    get_json("/config") != original_config):
+                print("[FAIL] could not swap back to the original database and model", file=sys.stderr)
+                return False
+            if post_json("/version", {"modules": [DEMO_MODULE]}) != ["premise-packed-batch-v1"]:
+                print("[FAIL] swapping the model changed the original database", file=sys.stderr)
                 return False
         finally:
             try:
@@ -462,7 +481,7 @@ Start
 The cache uses SQLite for module, declaration, and embedding data. FAISS is
 rebuilt in memory when a database is selected:
   --index-db : optional initial SQLite premise database
-  PUT /index: select or replace the active database after startup
+  PUT /config: select the active database and its model after startup
 Pretty-printed declaration strings are sent by Lean only to compute embeddings;
 they are not stored in the database.
 
@@ -473,13 +492,15 @@ they are not stored in the database.
 API
 ---
 
-GET /index returns {{"path":".../premise.db"}}, or {{"path":null}} if none is selected.
-PUT /index with JSON {{"path":"/absolute/path/to/premise.db"}} selects a database
-and returns {{"ok":true}}. The replacement is opened before it becomes active;
-selecting the current path is a no-op.
-PUT /model with JSON {{"path":"/absolute/path/to/model.gguf"}} replaces the active
-embedding model, returns {{"ok":true}}, and resets the active database.
-Selecting the current model path is a no-op.
+GET /config returns {{"index":".../premise.db","model":".../model.gguf"}}; "index"
+is null if no database is selected.
+PUT /config with JSON {{"index":"/absolute/path/to/premise.db",
+"model":"/absolute/path/to/model.gguf"}} selects a database together with the
+embedding model its vectors were computed with, and returns {{"ok":true}}. Both
+fields are required. The model is loaded and the database opened before either
+becomes active, so a failed request leaves the current pair in place; selecting
+the current pair is a no-op. The database is opened as-is and never reset, so
+give each model its own database.
 
 1. Check which module tokens are already cached in this process.
 

@@ -59,9 +59,10 @@ def train(model_name, rows, out_dir, epochs, batch_size, n_neg):
     model.save_pretrained(out); tok.save_pretrained(out)
     return out
 
-def load_model(server, gguf, timeout):
-    url = server.rstrip("/") + "/model"
-    req = urllib.request.Request(url, data=json.dumps({"path": str(Path(gguf).resolve())}).encode(), headers={"Content-Type": "application/json"}, method="PUT")
+def load_config(server, db, gguf, timeout):
+    url = server.rstrip("/") + "/config"
+    config = {"index": str(Path(db).resolve()), "model": str(Path(gguf).resolve())}
+    req = urllib.request.Request(url, data=json.dumps(config).encode(), headers={"Content-Type": "application/json"}, method="PUT")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             body = json.loads(resp.read().decode())
@@ -108,7 +109,10 @@ def main():
         hf = train(model_name, rows, round_dir, args.epochs, args.batch_size, args.n_neg)
         gguf = round_dir / "model.f16.gguf"
         subprocess.check_call([sys.executable, str(CONVERT), str(hf), "--outfile", str(gguf), "--outtype", "f16"])
-        load_model(args.server, gguf, args.load_timeout)
+        db = round_dir / "premise.db"
+        for suffix in ("", "-wal", "-shm"):
+            db.with_name(db.name + suffix).unlink(missing_ok=True)
+        load_config(args.server, db, gguf, args.load_timeout)
         for lean in files:
             for suffix in (".extract.jsonl", ".extract.jsonl.tmp", ".premises.jsonl"):
                 lean.with_suffix(suffix).unlink(missing_ok=True)

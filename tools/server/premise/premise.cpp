@@ -74,6 +74,14 @@ static int json_int(const json & obj, const char * key, int fallback) {
     return it != obj.end() && it->is_number_integer() ? it->get<int>() : fallback;
 }
 
+static std::string json_path(const json & obj, const char * key) {
+    const std::string path = json_string(obj, key);
+    if (path.empty() || path.find('\0') != std::string::npos) {
+        throw std::runtime_error(std::string("missing or invalid ") + key);
+    }
+    return path;
+}
+
 static std::vector<std::string> json_string_array(const json & obj, const char * key) {
     std::vector<std::string> out;
     auto it = obj.find(key);
@@ -131,14 +139,8 @@ static json hits_to_json(const std::vector<PremiseIndex::Hit> & hits) {
 // Setup / cleanup
 // ---------------------------------------------------------------------------
 
-bool premise_setup(server_context & ctx_server, const std::string & database_path) {
-    auto * server_ctx = ctx_server.get_llama_context();
-    if (!server_ctx) {
-        return false;
-    }
-
-    llama_model * model = const_cast<llama_model *>(llama_get_model(server_ctx));
-
+// Pooling and thread settings are copied from `like`.
+static llama_context * make_embed_context(llama_model * model, llama_context * like) {
     // Pack many short declarations without scaling allocations to models with
     // very large trained contexts.
     const uint32_t n_batch_window = 4096;
@@ -149,11 +151,21 @@ bool premise_setup(server_context & ctx_server, const std::string & database_pat
     embed_params.n_seq_max = (std::min)(256u, (uint32_t) llama_max_parallel_sequences());
     embed_params.embeddings = true;
     embed_params.kv_unified = true;
-    embed_params.pooling_type = llama_pooling_type(server_ctx);
-    embed_params.n_threads = llama_n_threads(server_ctx);
-    embed_params.n_threads_batch = llama_n_threads_batch(server_ctx);
+    embed_params.pooling_type = llama_pooling_type(like);
+    embed_params.n_threads = llama_n_threads(like);
+    embed_params.n_threads_batch = llama_n_threads_batch(like);
+    return llama_init_from_model(model, embed_params);
+}
 
-    llama_context * embed_ctx = llama_init_from_model(model, embed_params);
+bool premise_setup(server_context & ctx_server, const std::string & database_path) {
+    auto * server_ctx = ctx_server.get_llama_context();
+    if (!server_ctx) {
+        return false;
+    }
+
+    llama_model * model = const_cast<llama_model *>(llama_get_model(server_ctx));
+
+    llama_context * embed_ctx = make_embed_context(model, server_ctx);
     if (!embed_ctx) {
         SRV_ERR("%s", "failed to create embedding context\n");
         return false;
@@ -383,104 +395,80 @@ static std::vector<PremiseIndex::Hit> select_hits(
 }
 
 // ---------------------------------------------------------------------------
-// HTTP: GET/PUT /index; POST /version, /cache, /select
+// HTTP: GET/PUT /config; POST /version, /cache, /select
 // ---------------------------------------------------------------------------
 
-// GET /index (no body) -> { "path": string | null }
-static json handle_index_status() {
+// GET /config (no body) -> { "index": string | null, "model": string }
+static json handle_config_status() {
     if (!g_premise) {
         throw std::runtime_error("premise not initialized");
     }
     std::lock_guard<std::mutex> lock(g_index_mutex);
-    return json{{"path", g_premise->index ? json(g_premise->database_path) : json(nullptr)}};
+    return json{
+        {"index", g_premise->index ? json(g_premise->database_path) : json(nullptr)},
+        {"model", g_premise->model_path},
+    };
 }
 
-// PUT /index { "path": string } -> { "ok": true }
-static json handle_index(const json & body) {
-    if (!g_premise) {
-        throw std::runtime_error("premise not initialized");
-    }
-    const std::string path = json_string(body, "path");
-    if (path.empty() || path.find('\0') != std::string::npos) {
-        throw std::runtime_error("missing or invalid path");
-    }
-
-    if (g_premise->index && g_premise->database_path == path) {
-        return json{{"ok", true}};
-    }
-    auto replacement = std::make_unique<PremiseIndex>();
-    replacement->open(path, g_premise->embed_dim);
-    g_premise->database_path = path;
-    g_premise->index = std::move(replacement);
-
-    SRV_INF("serving premise database: path='%s'\n", path.c_str());
-    return json{{"ok", true}};
-}
-
-// PUT /model { "path": string } -> { "ok": true }
-static json handle_model(const json & body) {
+// PUT /config { "index": string, "model": string } -> { "ok": true }
+static json handle_config(const json & body) {
     if (!g_premise || !g_premise->embed_ctx) {
         throw std::runtime_error("premise not initialized");
     }
-    const std::string path = json_string(body, "path");
-    if (path.empty() || path.find('\0') != std::string::npos) {
-        throw std::runtime_error("missing or invalid path");
-    }
-    if (g_premise->model_path == path) {
+    const std::string index_path = json_path(body, "index");
+    const std::string model_path = json_path(body, "model");
+
+    const bool same_model = g_premise->model_path == model_path;
+    if (same_model && g_premise->index && g_premise->database_path == index_path) {
         return json{{"ok", true}};
     }
 
-    common_params load_params = g_load_params;
-    load_params.model.path = path;
-    load_params.fit_params = false;
-    auto loaded = common_init_from_params(load_params, true);
-    if (!loaded || !loaded->model()) {
-        throw std::runtime_error("failed to load model");
-    }
-    llama_context * like = g_premise->embed_ctx;
-    const uint32_t n_batch_window = 4096;
-    llama_context_params embed_params = llama_context_default_params();
-    embed_params.n_ctx = n_batch_window;
-    embed_params.n_batch = n_batch_window;
-    embed_params.n_ubatch = n_batch_window;
-    embed_params.n_seq_max = (std::min)(256u, (uint32_t) llama_max_parallel_sequences());
-    embed_params.embeddings = true;
-    embed_params.kv_unified = true;
-    embed_params.pooling_type = llama_pooling_type(like);
-    embed_params.n_threads = llama_n_threads(like);
-    embed_params.n_threads_batch = llama_n_threads_batch(like);
-    llama_context * embed_ctx = llama_init_from_model(loaded->model(), embed_params);
-    if (!embed_ctx) {
-        throw std::runtime_error("failed to create embedding context");
-    }
-    if (!g_premise->database_path.empty()) {
-        const std::string db = g_premise->database_path;
-        const int embed_dim = llama_model_n_embd_out(loaded->model());
-        g_premise->index.reset();
-        std::remove(db.c_str());
-        std::remove((db + "-wal").c_str());
-        std::remove((db + "-shm").c_str());
-        try {
-            auto replacement = std::make_unique<PremiseIndex>();
-            replacement->open(db, embed_dim);
-            g_premise->embed_dim = embed_dim;
-            g_premise->index = std::move(replacement);
-        } catch (...) {
-            llama_free(embed_ctx);
-            throw;
+    common_init_result_ptr loaded;
+    llama_context * embed_ctx = nullptr;
+    int embed_dim = g_premise->embed_dim;
+    if (!same_model) {
+        common_params load_params = g_load_params;
+        load_params.model.path = model_path;
+        load_params.fit_params = false;
+        loaded = common_init_from_params(load_params, true);
+        if (!loaded || !loaded->model()) {
+            throw std::runtime_error("failed to load model");
         }
+        embed_ctx = make_embed_context(loaded->model(), g_premise->embed_ctx);
+        if (!embed_ctx) {
+            throw std::runtime_error("failed to create embedding context");
+        }
+        embed_dim = llama_model_n_embd_out(loaded->model());
     }
 
-    std::lock_guard<std::mutex> embed_lock(g_premise->embed_mutex);
-    llama_free(g_premise->embed_ctx);
-    g_premise->embed_ctx = embed_ctx;
-    g_premise->model_path = path;
-    g_swapped_model = std::move(loaded);
-    if (g_ctx_server) {
-        g_ctx_server->release_model();
-        g_ctx_server = nullptr;
+    // open before swapping anything, so a failure leaves the active pair untouched
+    auto replacement = std::make_unique<PremiseIndex>();
+    try {
+        replacement->open(index_path, embed_dim);
+    } catch (...) {
+        if (embed_ctx) {
+            llama_free(embed_ctx);
+        }
+        throw;
     }
-    SRV_INF("serving premise model: path='%s'\n", path.c_str());
+
+    if (embed_ctx) {
+        std::lock_guard<std::mutex> embed_lock(g_premise->embed_mutex);
+        llama_free(g_premise->embed_ctx);
+        g_premise->embed_ctx = embed_ctx;
+        g_premise->embed_dim = embed_dim;
+        g_premise->model_path = model_path;
+        g_swapped_model = std::move(loaded);
+        if (g_ctx_server) {
+            g_ctx_server->release_model();
+            g_ctx_server = nullptr;
+        }
+    }
+    g_premise->database_path = index_path;
+    g_premise->index = std::move(replacement);
+
+    SRV_INF("serving premise config: index='%s', model='%s'\n",
+            index_path.c_str(), model_path.c_str());
     return json{{"ok", true}};
 }
 
@@ -589,15 +577,14 @@ void premise_register_http_routes(const server_http_context & ctx_http) {
         };
     };
 
-    ctx_http.get("/index", [](const server_http_req &) -> server_http_res_ptr {
+    ctx_http.get("/config", [](const server_http_req &) -> server_http_res_ptr {
         try {
-            return make_json_response(handle_index_status());
+            return make_json_response(handle_config_status());
         } catch (const std::exception & e) {
             return make_error_response(e);
         }
     });
-    ctx_http.put("/index", post_json(handle_index));
-    ctx_http.put("/model", post_json(handle_model));
+    ctx_http.put("/config", post_json(handle_config));
     ctx_http.post("/version", post_json(handle_version));
     ctx_http.post("/cache",   post_json(handle_cache));
     ctx_http.post("/select",  post_json(handle_select));
@@ -615,7 +602,7 @@ static void print_premise_usage(int, char **) {
     printf("  --premise\n");
     printf("      run as premise retrieval server instead of generation server\n\n");
     printf("  --index-db FILE\n");
-    printf("      initial SQLite premise database (optional; can be set with PUT /index)\n\n");
+    printf("      initial SQLite premise database (optional; can be set with PUT /config)\n\n");
 }
 
 static void premise_signal_handler(int signal) {
