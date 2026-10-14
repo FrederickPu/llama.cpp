@@ -85,18 +85,18 @@ def main():
     p.add_argument("entry", nargs="?", default=str(LOOP / ".lake/packages/mathlib/Mathlib"))
     p.add_argument("--server", default=SERVER)
     p.add_argument("--model", default=BASE_MODEL)
-    p.add_argument("--out", default=str(LOOP / "out/premise-loop"))
+    p.add_argument("--out", default=str(LOOP / "out/training"))
     for name, default in [("rounds", 2), ("epochs", 1), ("batch-size", 16), ("n-neg", 8), ("extract-attempts", 5), ("load-timeout", 600)]:
         p.add_argument("--" + name, type=int, default=default)
     args = p.parse_args()
-    if not (LOOP / ".lake/packages/CanonicalDrafter/lakefile.toml").is_file():
+    if not (LOOP / ".lake/packages/Canonical/lakefile.lean").is_file():
         subprocess.check_call(["lake", "update"], cwd=LOOP)
     entry = Path(args.entry)
     entry = entry.resolve() if entry.is_absolute() else (LOOP / entry).resolve()
     files, model_name = lean_files(entry), args.model
     for rnd in range(args.rounds):
         for _ in range(args.extract_attempts):
-            if subprocess.call(["lake", "exe", "CanonicalDrafter/extract_data", str(entry)], cwd=LOOP) == 0:
+            if subprocess.call(["lake", "exe", "extract_data", str(entry)], cwd=LOOP) == 0:
                 break
         else:
             raise SystemExit("extract_data failed")

@@ -1,7 +1,0 @@
-name = "premise-loop"
-version = "0.1.0"
-
-[[require]]
-name = "CanonicalDrafter"
-git = "https://github.com/FrederickPu/CanonicalDrafter.git"
-rev = "premise-selection"
