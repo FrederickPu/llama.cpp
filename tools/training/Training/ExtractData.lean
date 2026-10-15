@@ -1,4 +1,5 @@
 import Lean
+import Batteries.Data.List.Basic
 import Canonical.Canonical2.Basic
 import Canonical.Canonical2.LLM
 import Training.Repo
@@ -156,8 +157,6 @@ def premise (range : Position × Position) (filepath : System.FilePath) (prevEnv
       goal.withContext do
         if ← test (automateGrind goal premises) then
           IO.println "(grind)"
-        else if ← test (automateCanonical goal premises (timeout := 1)) then
-          IO.println "(canonical)"
         else if ← test (automateLibrarySearch goal) then
           IO.println "(librarySearch)"
         else
@@ -389,6 +388,10 @@ partial def processSnapshot (ctx : ExtractCtx)
   if let some next := snap.nextCmdSnap? then
     processSnapshot ctx next.task.get snap.elabSnap.resultSnap.get.cmdState.env (idx + 1)
 
+end Canonical2
+
+open Canonical2
+
 unsafe def main (args : List String) : IO Unit := do
   let [entry] := args |
     IO.println "Usage: extract_data <entry_directory>"
@@ -437,7 +440,7 @@ unsafe def main (args : List String) : IO Unit := do
       ) :: tasks
 
   for task in tasks do
-    let _ ← task.get
+    let _ ← MonadExcept.ofExcept task.get
 
   IO.println "Done processing all files"
 where

@@ -1,4 +1,5 @@
 import Lean
+import Batteries.Tactic.OpenPrivate
 
 namespace Lean
 
@@ -11,10 +12,9 @@ open private ImportedModule.toEffectiveImport from Lean.Environment
 open private ImportedModule.mainModule? from Lean.Environment
 open private ImportedModule.needsIRTrans from Lean.Environment
 open private ImportedModule.parts from Lean.Environment
-open private ImportedModule.irData? from Lean.Environment
+open private ImportedModule.irParts from Lean.Environment
 open private readModuleDataPartsOfMod from Lean.Environment
-open private envExtensionsRef from Lean.Environment
-open private finalizePersistentExtensions from Lean.Environment
+open private readIRPartsOfMod from Lean.Environment
 open Lean Elab System
 
 partial def importModulesCore'
@@ -64,8 +64,8 @@ where
     | none =>
       -- newly discovered module
       let parts  ← if needsData then loadData i else pure #[]
-      let irData? ← if needsIR then loadIR? i else pure none
-      return some (ImportedModule.mk ({ i with importAll, isExported, irPhases, hasData := needsData }) parts irData? needsIRTrans)
+      let irParts ← if needsIR then loadIR i else pure #[]
+      return some (ImportedModule.mk ({ i with importAll, isExported, irPhases, hasData := needsData }) parts irParts needsIRTrans)
     | some mod =>
       -- cached module: merge flags
       let importAll'    := importAll    || mod.importAll
@@ -79,9 +79,9 @@ where
           irPhases' == mod.irPhases then
         return none  -- nothing changed
       let parts  ← if needsData' && (ImportedModule.parts mod).isEmpty then loadData i else pure (ImportedModule.parts mod)
-      let irData? ← if needsIR' && (ImportedModule.irData? mod).isNone then loadIR? i else pure (ImportedModule.irData? mod)
+      let irParts ← if needsIR' && (ImportedModule.irParts mod).isEmpty then loadIR i else pure (ImportedModule.irParts mod)
       let imp := (ImportedModule.toEffectiveImport mod).toImport
-      return some (ImportedModule.mk (EffectiveImport.mk (Import.mk imp.module importAll' isExported' imp.isMeta) irPhases' needsData') parts irData? needsIRTrans')
+      return some (ImportedModule.mk (EffectiveImport.mk (Import.mk imp.module importAll' isExported' imp.isMeta) irPhases' needsData') parts irParts needsIRTrans')
   loadData i := do
     if let some arts := arts.find? i.module then
       -- Opportunistically load all available parts.
@@ -90,13 +90,14 @@ where
       readModuleDataParts fnames
     else
       readModuleDataPartsOfMod i.module
-  loadIR? i := do
-    let irFile? ← if let some arts := arts.find? i.module then
-      pure arts.ir?
+  -- .ir.sig + .ir (optional)
+  loadIR i := do
+    if let some arts := arts.find? i.module then
+      -- Opportunistically load all available parts.
+      -- Producer (e.g., Lake) should limit parts to the proper import level.
+      readModuleDataParts arts.irParts
     else
-      let irFile := (← findOLean i.module).withExtension "ir"
-      pure (guard (← irFile.pathExists) *> irFile)
-    irFile?.mapM (readModuleData ·)
+      readIRPartsOfMod i.module
 
 unsafe def mkFileStateCached (fileName : FilePath) (s : Std.HashMap Name ImportedModule)
   (extraImports : Array Import := #[]) : IO (Std.HashMap Name ImportedModule × Parser.InputContext × Parser.ModuleParserState × Command.State × FileMap) := do
