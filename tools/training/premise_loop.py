@@ -2,7 +2,7 @@
 """Mine premises, train, reload the premise server, repeat.
 
     python tools/training/premise_loop.py [ENTRY]
-    # ENTRY: .lean file, directory, or .txt of paths (default Mathlib/Init.lean)
+    # ENTRY: .lean file, directory, or .txt of paths (default Mathlib/Order/Defs/LinearOrder.lean)
     # Starts premise-server if it is down. Later rounds swap model and db with PUT /config.
     # Flags: --rounds --epochs --batch-size --n-neg --model --out --extract-attempts --load-timeout
 """
@@ -15,7 +15,9 @@ from transformers import AutoModel, AutoTokenizer
 LOOP = Path(__file__).resolve().parent
 LLAMA = LOOP.parents[1]
 CONVERT = LLAMA / "convert_hf_to_gguf.py"
-BASE_MODEL = "l3lab/all-distilroberta-v1-lr2e-4-bs256-nneg3-ml-ne2"
+# The Lean-trained HF checkpoints (l3lab/hanwenzhu ...-ml-ne2) are now empty repos, so the
+# base model is rebuilt from the premise server's GGUF on top of its architecture repo.
+ARCH_MODEL = "sentence-transformers/all-distilroberta-v1"
 SERVER = "http://127.0.0.1:8766"
 LR, TEMP, MAX_LEN = 2e-5, 0.05, 512
 
@@ -23,11 +25,11 @@ def lean_files(entry: Path) -> list[Path]:
     if entry.is_dir():
         return [p for p in entry.rglob("*.lean") if not any(x.startswith(".") for x in p.relative_to(entry).parts)]
     if entry.suffix == ".txt":
-        return [(p if (p := Path(s)).is_absolute() else LOOP / p) for line in entry.read_text().splitlines() if (s := line.split("#", 1)[0].strip())]
+        return [(p if (p := Path(s)).is_absolute() else LOOP / p) for line in entry.read_text(encoding="utf-8").splitlines() if (s := line.split("#", 1)[0].strip())]
     return [entry]
 
 def jsonl(path: Path) -> list[dict]:
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()] if path.is_file() else []
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()] if path.is_file() else []
 
 def pick_device():
     if torch.cuda.is_available():
@@ -146,6 +148,55 @@ def ensure_premise_model() -> Path:
     download(f"https://huggingface.co/{repo}/resolve/main/{filename}", dest)
     return dest
 
+def hf_snapshot(repo: str, patterns: list[str]) -> Path:
+    from huggingface_hub import snapshot_download
+    for attempt in range(10):
+        try:
+            return Path(snapshot_download(repo, allow_patterns=patterns))
+        except Exception as exc:  # the hub drops connections intermittently
+            print(f"retry {repo}: {exc!r}"[:200], flush=True)
+            time.sleep(3)
+    raise SystemExit(f"could not download {repo}")
+
+GGUF_TO_HF = {
+    "token_embd": "embeddings.word_embeddings", "position_embd": "embeddings.position_embeddings",
+    "token_types": "embeddings.token_type_embeddings", "token_embd_norm": "embeddings.LayerNorm",
+    "attn_q": "attention.self.query", "attn_k": "attention.self.key", "attn_v": "attention.self.value",
+    "attn_output": "attention.output.dense", "attn_output_norm": "attention.output.LayerNorm",
+    "ffn_up": "intermediate.dense", "ffn_down": "output.dense", "layer_output_norm": "output.LayerNorm",
+}
+
+def ensure_base_model() -> Path:
+    """HF checkpoint of the premise server's GGUF: its weights loaded into `ARCH_MODEL`."""
+    out = cache_dir() / "lean-premise-hf"
+    if (out / "model.safetensors").is_file():
+        return out
+    sys.path.insert(0, str(LLAMA / "gguf-py"))
+    import re, numpy as np, gguf
+    arch = hf_snapshot(ARCH_MODEL, ["*.json", "*.txt", "model.safetensors", "1_Pooling/*"])
+    model, tok = AutoModel.from_pretrained(arch), AutoTokenizer.from_pretrained(arch)
+    sd = model.state_dict()
+    reader = gguf.GGUFReader(ensure_premise_model())
+    toks = reader.fields["tokenizer.ggml.tokens"]
+    if [bytes(toks.parts[i]).decode("utf-8") for i in toks.data] != [t for t, _ in sorted(tok.get_vocab().items(), key=lambda kv: kv[1])]:
+        raise SystemExit(f"premise GGUF vocab differs from {ARCH_MODEL}")
+    loaded = set()
+    for t in reader.tensors:
+        stem, kind = t.name.rsplit(".", 1)
+        m = re.fullmatch(r"blk\.(\d+)\.(\w+)", stem)
+        key = f"encoder.layer.{m[1]}.{GGUF_TO_HF[m[2]]}.{kind}" if m else f"{GGUF_TO_HF[stem]}.{kind}"
+        data = torch.from_numpy(np.array(t.data, dtype=np.float32))
+        # convert_hf_to_gguf drops RoBERTa's first `1 + pad_token_id` position rows
+        target = sd[key][sd[key].shape[0] - data.numel() // sd[key][0].numel():] if key == "embeddings.position_embeddings.weight" else sd[key]
+        target.copy_(data.reshape(target.shape))
+        loaded.add(key)
+    if missing := {k for k in sd if not k.startswith("pooler.")} - loaded:
+        raise SystemExit(f"premise GGUF is missing {sorted(missing)}")
+    model.load_state_dict(sd)
+    model.save_pretrained(out); tok.save_pretrained(out)
+    copy_pooling(arch, out)
+    return out
+
 def server_up(url: str) -> bool:
     try:
         with urllib.request.urlopen(url.rstrip("/") + "/health", timeout=2) as resp:
@@ -182,9 +233,9 @@ def run(cmd):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("entry", nargs="?", default=str(LOOP / ".lake/packages/mathlib/Mathlib/Init.lean"))
+    p.add_argument("entry", nargs="?", default=str(LOOP / ".lake/packages/mathlib/Mathlib/Order/Defs/LinearOrder.lean"))
     p.add_argument("--server", default=SERVER)
-    p.add_argument("--model", default=BASE_MODEL)
+    p.add_argument("--model", help="HF model to start from (default: the premise server's GGUF)")
     p.add_argument("--out", default=str(LOOP / "out/training"))
     for name, default in [("rounds", 2), ("epochs", 1), ("batch-size", 16), ("n-neg", 8), ("extract-attempts", 5), ("load-timeout", 600)]:
         p.add_argument("--" + name, type=int, default=default)
@@ -195,7 +246,7 @@ def main():
         run(["lake", "update"])
     entry = Path(args.entry)
     entry = entry.resolve() if entry.is_absolute() else (LOOP / entry).resolve()
-    files, model_name = lean_files(entry), args.model
+    files, model_name = lean_files(entry), args.model or str(ensure_base_model())
     for rnd in range(args.rounds):
         print(f"extract round {rnd}", flush=True)
         for _ in range(args.extract_attempts):

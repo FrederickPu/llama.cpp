@@ -1,17 +1,18 @@
 import Lean
-import Batteries.Data.List.Basic
-import Canonical.Canonical2.Basic
-import Canonical.Canonical2.LLM
+import Lake
+import Canonical
 import Training.Repo
 import Training.InfoTree
 import Training.Basic
 
 open Lean Meta Elab Tactic
+open Canonical2 hiding Premise getKind
 
-namespace Canonical2
+def EXTRACT_DRAFTS : Bool := false
+def EXTRACT_AUTOMATION : Bool := false
+def EXTRACT_LLM : Bool := false
 
-def isNumericSubscript (c : Char) : Bool :=
-  '₀' ≤ c && c ≤ '₉'
+initialize draftStats : IO.Ref (Nat × Nat) ← IO.mkRef (0, 0)
 
 def subscriptToNum (c : Char) : Char :=
   match c with
@@ -47,11 +48,41 @@ inductive Kind
 | goal : Kind -- imp case
 deriving ToJson
 
+/-- A goal with its used premises and the selector's false positives (those it
+ranked above every used premise), all rendered as the selector sees them. -/
 structure Premise where
   goal : String
   tactic : String
-  premises : Array Name
+  premises : Array String
+  negativePremises : Array String
 deriving ToJson
+
+private def getKind (cinfo : ConstantInfo) : MetaM String := do
+  let env ← getEnv
+  return match cinfo with
+    | .axiomInfo _  => "axiom"
+    | .thmInfo _    => "theorem"
+    | .opaqueInfo _ => "opaque"
+    | .defnInfo i   => if isInstanceCore env i.name then "instance" else "def"
+    | .inductInfo i =>
+      if isClass env i.name then "class"
+      else if isStructure env i.name then "structure"
+      else "inductive"
+    | .ctorInfo _ | .recInfo _ | .quotInfo _ => "def"
+
+/-- Copy of `Canonical.Canonical2.PremiseSelection.toPremise`'s rendering (docstring,
+kind, signature; `none` when denied or unprintable). Training data must match the
+text the premise server embeds exactly, so keep this in sync with it. -/
+def renderPremise (name : Name) : MetaM (Option String) := do
+  if LibrarySuggestions.isDeniedPremise (← getEnv) name then return none
+  withCurrHeartbeats do try
+    let kind ← getKind (← getConstInfo name)
+    let ⟨fmt, _⟩ ← PrettyPrinter.ppSignature name
+    let docPrefix := match ← findSimpleDocString? (← getEnv) name with
+      | some doc => "/-- " ++ doc.dropSuffix " " ++ " -/\n"
+      | none => ""
+    return some (docPrefix ++ kind ++ " " ++ fmt.pretty 1000000000)
+  catch _ => return none
 
 -- structure Automation where
 --   goal : String
@@ -77,7 +108,7 @@ structure HaveDraft where
   name : String
   type : String
   removals : Array String
-  messages : Array Message
+  messages : Array Canonical2.Message
   tools : Json
 deriving ToJson
 
@@ -106,48 +137,18 @@ def hypsDiff (goalBefore : MVarId) (goalAfter : MVarId) : MetaM (Array LocalDecl
 def goalCopy (goal : MVarId) : MetaM MVarId := do
   return (← goal.withContext do mkFreshExprMVar (← goal.getType)).mvarId!
 
-def isDuplicate (mvar : MVarId) (type : Expr) : MetaM Bool := do
-  withTransparency .none do
-    let goalType ← mvar.getType
-    let any ← (← mvar.getDecl).lctx.anyM fun decl => isDefEqGuarded type decl.type
-    return any || (← isDefEqGuarded type goalType)
-
-def goalPremisesMessage (goal premises : String) : Message :=
-  { role := "user", content := s!"Goal:\n```lean4\n{goal}\n```\n\nLibrary theorems:\n```lean4\n{premises}\n```" }
-
-def subgoalPrompt (goal : String) (premises : String) : Array Message :=
-  #[{ role := "system", content := "Propose one intermediate `have` toward the goal." }, goalPremisesMessage goal premises]
-
-def haveSchema (hyps : Array String) : Json := Json.mkObj [
-    ("type", "object"),
-    ("properties", Json.mkObj [
-      ("type", Json.mkObj [("type", "string")]),
-      ("name", Json.mkObj [("type", "string")]),
-      ("clear", Json.mkObj [
-        ("type", "array"),
-        ("items", Json.mkObj [("type", "string"), ("enum", Json.arr (hyps.map Json.str))])
-      ])
-    ]),
-    ("required", Json.arr #["type", "name", "clear"])
-  ]
-
-def subgoalTools (hyps : Array String) : Json :=
-  Json.arr #[Json.mkObj [
-    ("type", "function"),
-    ("function", Json.mkObj [
-      ("name", "have"),
-      ("parameters", haveSchema hyps)
-    ])
-  ]]
 
 def premise (range : Position × Position) (filepath : System.FilePath) (prevEnv : Environment) (tactic : String) (original : MVarId) (premises : Array Name) : MetaM Premise := do
   let original ← (← original.clone).exposeNames
+  let ranked := (← LibrarySuggestions.select original { maxSuggestions := 30 }).map (·.name)
   let result := {
     goal := (← Meta.ppGoal original).pretty,
-    tactic, premises
+    tactic,
+    premises := ← premises.filterMapM renderPremise,
+    negativePremises := ← (rankedNegatives ranked (.ofArray premises)).filterMapM renderPremise
   }
 
-  if (← IO.rand 0 99) == 0 then withEnv prevEnv try
+  if EXTRACT_AUTOMATION && (← IO.rand 0 99) == 0 then withEnv prevEnv try
     IO.print s!"{filepath} {range}: {tactic} "
     original.withContext do preprocess original
     if let #[goal] := (← getMVarsNoDelayed (← instantiateMVars (.mvar original))) then
@@ -170,11 +171,46 @@ def premise (range : Position × Position) (filepath : System.FilePath) (prevEnv
 
   return result
 
+structure DraftCheck where
+  tactic : String
+  goal : String
+  type : String
+  generated : String
+  premises : Array String
+  defeq : Bool
+deriving ToJson
+
+def checkDraft (filepath : System.FilePath) (range : Position × Position) (tactic : String)
+    (goal : MVarId) (desired : Expr) (premises : Array Name) : MetaM Unit := do
+  unless EXTRACT_LLM do return
+  let goalString := (← Meta.ppGoal goal).pretty
+  let typeString ← pp desired
+  let rendered ← premises.filterMapM renderPremise
+  let checksFile := ((← IO.FS.realPath filepath).toString.dropSuffix ".lean").toString ++ ".checks.jsonl"
+  let provider : Provider := .Llama s!"http://{daemonHost}:{daemonPort}/chat/completions"
+  let (hit, generated, tag) ← try
+    let task ← generate (fun _ _ => pure ()) goal premises provider
+    match task.task.get with
+    | .error e => pure (false, s!"{e}", "(error)")
+    | .ok (subgoal, _, sMeta) =>
+      let eq ← goal.withContext do withMCtx sMeta.mctx do isDefEqGuarded subgoal.type desired
+      let generated ← goal.withContext do withMCtx sMeta.mctx do pp subgoal.type
+      pure (eq, generated, if eq then "(defeq)" else "(mismatch)")
+  catch e =>
+    pure (false, s!"{← e.toMessageData.toString}", "(error)")
+  draftStats.modify fun (h, n) => (h + if hit then 1 else 0, n + 1)
+  appendJsonl checksFile ({
+    tactic, goal := goalString, type := typeString, generated,
+    premises := rendered, defeq := hit
+  } : DraftCheck)
+  printFlush s!"{range}: {tactic} {tag}\n"
+
 def draft (tacticText : String) (name : String) (goal : MVarId) (type : Expr)
   (kind : Kind) (removals : Array FVarId) : MetaM (Option HaveDraft) := do
+  unless EXTRACT_DRAFTS do return none
   let goal ← (← goal.clone).exposeNames
-  goal.withContext do
-    if ← isDuplicate goal type then return none
+  goal.withContext do try
+    let _ ← checkDuplicate goal type
     let goalString := (← Meta.ppGoal goal).pretty
     let typeString ← pp type
     let removalsStrs ← removals.mapM fun id => do pure (← id.getUserName).toString
@@ -191,15 +227,16 @@ def draft (tacticText : String) (name : String) (goal : MVarId) (type : Expr)
         ]).compress
       }
     }
-    let messages := (subgoalPrompt goalString "").push {
+    let messages := (subgoalPrompt goalString "" (Provider.Llama "")).push {
       role := "assistant", content := "", tool_calls := #[toolCall]
     }
-    let tools := subgoalTools hyps
+    let tools := subgoalTools hyps (Provider.Llama "")
     return some {
       tactic := tacticText, name, goal := goalString,
       kind, type := typeString, removals := removalsStrs,
       messages, tools
     }
+  catch _ => return none
 
 /-
  returns tuple and Array of (goal, name, type)
@@ -212,7 +249,7 @@ def haveDrafts (range : Position × Position) (filepath : System.FilePath) (prev
   let goalsBefore := goalsBefore.removeAll intersection
   let goalsAfter := goalsAfter.removeAll intersection
   let [gBefore] := goalsBefore | return (#[], #[])
-  let constants ← collectConstants tac gBefore
+  let constants ← collectConstants' tac gBefore
   if let [gAfter'] := goalsAfter then
     if ← isDefEqGuarded (← gAfter'.getType) (← gBefore.getType) then -- isDefEq used instead of == for mdata
       let (newHyps, removals) ← hypsDiff gBefore gAfter'
@@ -228,6 +265,7 @@ def haveDrafts (range : Position × Position) (filepath : System.FilePath) (prev
           let replaced ← gAfter'.withContext do pure ((← mkCurriedImplication letNewHyps h.type).replaceFVars subseq fvars)
 
           let (draft, fvar, goal', premise) ← goal.withContext do
+            checkDraft filepath range tacticText goal replaced constants.toArray
             let name ← disambiguate (desiredName h.userName tacticText)
             let draft ← draft tacticText name goal replaced .hypothesis (removals.map (·.fvarId))
             let (fvar, goal') ← goal.note name.toName (← Meta.mkSorry replaced false) replaced
@@ -250,6 +288,7 @@ def haveDrafts (range : Position × Position) (filepath : System.FilePath) (prev
     let imp ← gAfter.withContext do mkCurriedImplication newHyps (← gAfter.getType)
 
     let (draft, goal') ← goal.withContext do
+      checkDraft filepath range tacticText goal imp constants.toArray
       let gAfterName := ((← getMCtx).getDecl gAfter).userName
       let name ← disambiguate (desiredName gAfterName tacticText)
       let goal' := (← goal.note name.toName (← Meta.mkSorry imp false) imp).2
@@ -348,6 +387,9 @@ structure ExtractCtx where
   premisesFile : System.FilePath
   progressFile : System.FilePath
   skip : Std.HashSet String
+  /-- Selection quality: per record with any positives, `log (pos / (pos + neg))`;
+  summed with the record count for the file's geometric mean. -/
+  quality : IO.Ref (Nat × Float)
 
 /-- The output paths derived from a source file's base path (its path without the
 `.lean` suffix). Drafts/premises are appended to the `.jsonl` files as extraction
@@ -381,16 +423,16 @@ partial def processSnapshot (ctx : ExtractCtx)
     let trees := snap.elabSnap.infoTreeSnap.get.infoTree?.toList
     let (drafts, premises) ← trees.foldlM (init := (#[], #[])) fun acc t => do
       return acc ++ (← processInfoTree ctx.fileName prevEnv t).1
-    for draft in drafts do appendJsonl ctx.draftsFile draft
-    for premise in premises do appendJsonl ctx.premisesFile premise
+    if EXTRACT_DRAFTS then for draft in drafts do appendJsonl ctx.draftsFile draft
+    for premise in premises do
+      appendJsonl ctx.premisesFile premise
+      let pos := premise.premises.size
+      unless pos == 0 do
+        ctx.quality.modify fun (n, s) => (n + 1, s + Float.log (pos.toFloat / (pos + premise.negativePremises.size).toFloat))
     removeLastLine ctx.progressFile
     appendJsonl ctx.progressFile (ExtractEntry.mk key true)
   if let some next := snap.nextCmdSnap? then
     processSnapshot ctx next.task.get snap.elabSnap.resultSnap.get.cmdState.env (idx + 1)
-
-end Canonical2
-
-open Canonical2
 
 unsafe def main (args : List String) : IO Unit := do
   let [entry] := args |
@@ -399,6 +441,8 @@ unsafe def main (args : List String) : IO Unit := do
 
   Lean.initSearchPath (← Lean.findSysroot)
   enableInitializersExecution
+  if EXTRACT_LLM then
+    startSubgoalDaemon (fun _ _ => pure ())
   let mut state := {}
   let mut tasks := []
   let mut i := 0
@@ -421,7 +465,7 @@ unsafe def main (args : List String) : IO Unit := do
       IO.println s!"{filepath} ({i}/{files.size})"
 
       let (state', inputCtx, parserState, commandState₀, _) ← mkFileStateCached path state
-        #[{ module := `Canonical.Symbols }]
+        #[{ module := `Canonical.Canonical2.PremiseSelection }, { module := `Canonical.Symbols }]
       state := state'
       let st ← IO.processCommandsIncrementally inputCtx parserState
         { commandState₀ with infoState.enabled := true } none
@@ -430,8 +474,10 @@ unsafe def main (args : List String) : IO Unit := do
         let skip ← readSkip p.progress
         let ctx : ExtractCtx :=
           { fileName := filepath, draftsFile := p.drafts, premisesFile := p.premises,
-            progressFile := p.progress, skip }
+            progressFile := p.progress, skip, quality := ← IO.mkRef (0, 0.0) }
         processSnapshot ctx st.initialSnap commandState₀.env
+        let (n, s) ← ctx.quality.get
+        IO.println s!"{filepath}: premise selection quality {if n == 0 then "n/a" else toString (Float.exp (s / n.toFloat))} over {n} goals"
         -- Done: promote the per-command progress log to the completion marker (empty
         -- if the file had no commands). The drafts/premises jsonl are already on disk
         -- (appended as we went), so a crash before this just leaves them for resume.
@@ -440,8 +486,11 @@ unsafe def main (args : List String) : IO Unit := do
       ) :: tasks
 
   for task in tasks do
-    let _ ← MonadExcept.ofExcept task.get
+    let _ ← task.get
 
+  if EXTRACT_LLM then
+    let (hit, n) ← draftStats.get
+    IO.println s!"draft accuracy {hit}/{n}"
   IO.println "Done processing all files"
 where
   shouldSkip (leanPath donePath : System.FilePath) : IO Bool := do

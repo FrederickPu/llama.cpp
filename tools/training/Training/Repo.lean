@@ -1,5 +1,6 @@
 import Lean
-import Batteries.Tactic.OpenPrivate
+import Batteries
+import Lake
 
 namespace Lean
 
@@ -13,10 +14,13 @@ open private ImportedModule.mainModule? from Lean.Environment
 open private ImportedModule.needsIRTrans from Lean.Environment
 open private ImportedModule.parts from Lean.Environment
 open private ImportedModule.irParts from Lean.Environment
-open private readModuleDataPartsOfMod from Lean.Environment
 open private readIRPartsOfMod from Lean.Environment
+open private readModuleDataPartsOfMod from Lean.Environment
+open private envExtensionsRef from Lean.Environment
+open private finalizePersistentExtensions from Lean.Environment
 open Lean Elab System
 
+-- #check importModulesCore
 partial def importModulesCore'
     (imports : Array Import) (globalLevel : OLeanLevel := .private)
     (arts : NameMap ImportArtifacts := {}) (isExported : Bool := globalLevel < .private) :
@@ -63,7 +67,7 @@ where
     match (ImportState.moduleNameMap (← get))[i.module]? with
     | none =>
       -- newly discovered module
-      let parts  ← if needsData then loadData i else pure #[]
+      let parts ← if needsData then loadData i else pure #[]
       let irParts ← if needsIR then loadIR i else pure #[]
       return some (ImportedModule.mk ({ i with importAll, isExported, irPhases, hasData := needsData }) parts irParts needsIRTrans)
     | some mod =>
@@ -78,7 +82,7 @@ where
           needsData' == mod.hasData && needsIRTrans' == ImportedModule.needsIRTrans mod &&
           irPhases' == mod.irPhases then
         return none  -- nothing changed
-      let parts  ← if needsData' && (ImportedModule.parts mod).isEmpty then loadData i else pure (ImportedModule.parts mod)
+      let parts ← if needsData' && (ImportedModule.parts mod).isEmpty then loadData i else pure (ImportedModule.parts mod)
       let irParts ← if needsIR' && (ImportedModule.irParts mod).isEmpty then loadIR i else pure (ImportedModule.irParts mod)
       let imp := (ImportedModule.toEffectiveImport mod).toImport
       return some (ImportedModule.mk (EffectiveImport.mk (Import.mk imp.module importAll' isExported' imp.isMeta) irPhases' needsData') parts irParts needsIRTrans')
