@@ -3,10 +3,12 @@ import Canonical.Canonical2.Util
 
 open Lean Meta Elab Term
 
-/-- Premises the selector ranked above the highest-ranked used premise, minus the
-used ones: the false positives that outscored the truth. -/
+/-- Premises the selector ranked above the lowest-ranked used premise, minus the
+used ones: the false positives that outscored the truth. All of `ranked` when no
+used premise made the list, since then every suggestion outscored the truth. -/
 def rankedNegatives (ranked : Array Name) (used : NameSet) : Array Name :=
-  (ranked.popWhile (!used.contains ·)).filter (!used.contains ·)
+  let cut := if ranked.any used.contains then ranked.popWhile (!used.contains ·) else ranked
+  cut.filter (!used.contains ·)
 
 /-- `Canonical2.collectConstants`, but an identifier that is not a global constant
 (a hypothesis name in tactic syntax) contributes nothing instead of throwing. -/

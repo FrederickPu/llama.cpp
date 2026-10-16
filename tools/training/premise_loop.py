@@ -4,13 +4,14 @@
     python tools/training/premise_loop.py [ENTRY]
     # ENTRY: .lean file, directory, or .txt of paths (default Mathlib/Order/Defs/LinearOrder.lean)
     # Starts premise-server if it is down. Later rounds swap model and db with PUT /config.
-    # Flags: --rounds --epochs --batch-size --n-neg --model --out --extract-attempts --load-timeout
+    # Flags: --rounds --epochs --batch-size --n-neg --model --out --extract-attempts --load-timeout --save-every
+    # Rerun the same command to resume: finished rounds are skipped and training continues from its checkpoint.
 """
 import argparse, json, os, random, shutil, subprocess, sys, tarfile, time, urllib.error, urllib.request, zipfile
 from pathlib import Path
 import torch
 import torch.nn.functional as F
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
 
 LOOP = Path(__file__).resolve().parent
 LLAMA = LOOP.parents[1]
@@ -19,7 +20,7 @@ CONVERT = LLAMA / "convert_hf_to_gguf.py"
 # base model is rebuilt from the premise server's GGUF on top of its architecture repo.
 ARCH_MODEL = "sentence-transformers/all-distilroberta-v1"
 SERVER = "http://127.0.0.1:8766"
-LR, TEMP, MAX_LEN = 2e-5, 0.05, 512
+LR, TEMP, MAX_LEN, WARMUP = 2e-5, 0.05, 512, 0.1
 
 def lean_files(entry: Path) -> list[Path]:
     if entry.is_dir():
@@ -36,7 +37,7 @@ def pick_device():
         return "cuda"
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
         return "mps"
-    return "cpu"
+    raise SystemExit("no CUDA or MPS device; training on CPU is too slow")
 
 def embed(model, tok, texts, device):
     batch = tok(texts, padding=True, truncation=True, max_length=MAX_LEN, return_tensors="pt").to(device)
@@ -55,7 +56,7 @@ def copy_pooling(src, dst: Path):
         if path.is_dir() and mod.get("path"):
             shutil.copytree(path, dst / path.name, dirs_exist_ok=True)
 
-def train(model_name, rows, out_dir, epochs, batch_size, n_neg):
+def train(model_name, rows, out_dir, epochs, batch_size, n_neg, save_every):
     tok = AutoTokenizer.from_pretrained(model_name)
     model = AutoModel.from_pretrained(model_name)
     device = pick_device()
@@ -67,26 +68,63 @@ def train(model_name, rows, out_dir, epochs, batch_size, n_neg):
     ]
     if not examples:
         raise SystemExit("no premise pairs")
-    random.shuffle(examples)
+    steps_per_epoch = -(-len(examples) // batch_size)
+    total_steps = epochs * steps_per_epoch
     opt = torch.optim.AdamW(model.parameters(), lr=LR)
-    for epoch in range(epochs):
-        random.shuffle(examples)
+    sched = get_linear_schedule_with_warmup(opt, int(WARMUP * total_steps), total_steps)
+    ckpt, start = out_dir / "checkpoint.pt", 0
+    if ckpt.is_file():
+        state = torch.load(ckpt, map_location=device)
+        model.load_state_dict(state["model"]); opt.load_state_dict(state["opt"]); sched.load_state_dict(state["sched"])
+        start = state["step"]
+        print(f"resume from step {start}/{total_steps}", flush=True)
+    for epoch in range(start // steps_per_epoch, epochs):
+        # seeded per epoch so a resumed run replays the same batch order
+        order = list(range(len(examples)))
+        random.Random(epoch).shuffle(order)
         total, steps = 0.0, 0
-        for i in range(0, len(examples), batch_size):
-            batch = examples[i:i + batch_size]
+        for b in range(max(start - epoch * steps_per_epoch, 0), steps_per_epoch):
+            batch = [examples[j] for j in order[b * batch_size:(b + 1) * batch_size]]
             with torch.autocast(device, dtype=torch.bfloat16, enabled=device == "cuda"):
                 q = embed(model, tok, [g for g, _, _ in batch], device)
                 p = embed(model, tok, [p for _, p, _ in batch], device)
                 n = embed(model, tok, [t for *_, ns in batch for t in ns], device).view(len(batch), n_neg, -1)
                 scores = torch.cat([(q * p).sum(-1, keepdim=True), torch.einsum("bd,bkd->bk", q, n)], 1)
                 loss = F.cross_entropy(scores.float() / TEMP, torch.zeros(len(batch), dtype=torch.long, device=device))
-            opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
+            opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step(); sched.step()
             total += float(loss); steps += 1
+            step = epoch * steps_per_epoch + b + 1
+            if step % save_every == 0 and step < total_steps:
+                part = ckpt.with_name(ckpt.name + ".part")
+                torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(), "step": step}, part)
+                part.replace(ckpt)
+                print(f"step {step}/{total_steps} loss {total / steps:.4f} lr {sched.get_last_lr()[0]:.2e}", flush=True)
         print(f"epoch {epoch + 1} loss {total / steps:.4f}", flush=True)
-    out = out_dir / "hf"
-    model.save_pretrained(out); tok.save_pretrained(out)
-    copy_pooling(model_name, out)
+    out, part = out_dir / "hf", out_dir / "hf.part"
+    shutil.rmtree(part, ignore_errors=True)
+    model.save_pretrained(part); tok.save_pretrained(part)
+    copy_pooling(model_name, part)
+    part.rename(out)
+    ckpt.unlink(missing_ok=True)
     return out
+
+def to_gguf(hf, gguf: Path):
+    part = gguf.with_name(gguf.name + ".part")
+    subprocess.check_call([sys.executable, str(CONVERT), str(hf), "--outfile", str(part), "--outtype", "f16"])
+    part.replace(gguf)
+
+def start_gguf(model, out: Path) -> Path:
+    """GGUF of the starting model, so round 0 mines with the model it trains."""
+    if not model:
+        return ensure_premise_model()
+    gguf = out / "base" / "model.f16.gguf"
+    if not gguf.is_file():
+        # re-saved like the round outputs: a bare RobertaModel, which convert supports and *ForMaskedLM is not
+        hf = gguf.parent / "hf"
+        AutoModel.from_pretrained(model).save_pretrained(hf); AutoTokenizer.from_pretrained(model).save_pretrained(hf)
+        copy_pooling(model, hf)
+        to_gguf(hf, gguf)
+    return gguf
 
 def load_config(server, db, gguf, timeout):
     url = server.rstrip("/") + "/config"
@@ -237,7 +275,7 @@ def main():
     p.add_argument("--server", default=SERVER)
     p.add_argument("--model", help="HF model to start from (default: the premise server's GGUF)")
     p.add_argument("--out", default=str(LOOP / "out/training"))
-    for name, default in [("rounds", 2), ("epochs", 1), ("batch-size", 16), ("n-neg", 8), ("extract-attempts", 5), ("load-timeout", 600)]:
+    for name, default in [("rounds", 2), ("epochs", 1), ("batch-size", 16), ("n-neg", 8), ("extract-attempts", 5), ("load-timeout", 600), ("save-every", 1000)]:
         p.add_argument("--" + name, type=int, default=default)
     args = p.parse_args()
     start_premise(args.server)
@@ -247,33 +285,43 @@ def main():
     entry = Path(args.entry)
     entry = entry.resolve() if entry.is_absolute() else (LOOP / entry).resolve()
     files, model_name = lean_files(entry), args.model or str(ensure_base_model())
+    prev = (Path(args.out) / "base" / "premise.db", start_gguf(args.model, Path(args.out)))
     for rnd in range(args.rounds):
-        print(f"extract round {rnd}", flush=True)
-        for _ in range(args.extract_attempts):
-            try:
-                run(["lake", "exe", "extract_data", str(entry)])
-                break
-            except SystemExit:
-                continue
-        else:
-            raise SystemExit("extract_data failed")
-        rows = [row for lean in files for row in jsonl(lean.with_suffix(".premises.jsonl"))]
-        if not rows:
-            raise SystemExit("extract produced no premise rows")
         round_dir = Path(args.out) / f"round-{rnd}"
         round_dir.mkdir(parents=True, exist_ok=True)
-        (round_dir / "premises.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
-        hf = train(model_name, rows, round_dir, args.epochs, args.batch_size, args.n_neg)
-        gguf = round_dir / "model.f16.gguf"
-        subprocess.check_call([sys.executable, str(CONVERT), str(hf), "--outfile", str(gguf), "--outtype", "f16"])
-        db = round_dir / "premise.db"
-        for suffix in ("", "-wal", "-shm"):
-            db.with_name(db.name + suffix).unlink(missing_ok=True)
-        load_config(args.server, db, gguf, args.load_timeout)
-        for lean in files:
-            for suffix in (".extract.jsonl", ".extract.jsonl.tmp", ".premises.jsonl"):
-                lean.with_suffix(suffix).unlink(missing_ok=True)
-        model_name = str(hf)
+        data, hf, gguf, db = (round_dir / n for n in ("premises.jsonl", "hf", "model.f16.gguf", "premise.db"))
+        if gguf.is_file():
+            print(f"round {rnd} already trained", flush=True)
+        else:
+            # mine with the previous round's (or the starting) model; also restores it after a server restart
+            load_config(args.server, *prev, args.load_timeout)
+            if not data.is_file():
+                print(f"extract round {rnd}", flush=True)
+                for _ in range(args.extract_attempts):
+                    try:
+                        run(["lake", "exe", "extract_data", str(entry)])
+                        break
+                    except SystemExit:
+                        continue
+                else:
+                    raise SystemExit("extract_data failed")
+                rows = [row for lean in files for row in jsonl(lean.with_suffix(".premises.jsonl"))]
+                if not rows:
+                    raise SystemExit("extract produced no premise rows")
+                part = data.with_name(data.name + ".part")
+                part.write_text("".join(json.dumps(row) + "\n" for row in rows))
+                part.replace(data)
+            if not hf.is_dir():
+                train(model_name, jsonl(data), round_dir, args.epochs, args.batch_size, args.n_neg, args.save_every)
+            # before the gguf exists, so a finished round never leaves stale extraction behind
+            for lean in files:
+                for suffix in (".extract.jsonl", ".extract.jsonl.tmp", ".premises.jsonl"):
+                    lean.with_suffix(suffix).unlink(missing_ok=True)
+            to_gguf(hf, gguf)
+            for suffix in ("", "-wal", "-shm"):
+                db.with_name(db.name + suffix).unlink(missing_ok=True)
+        prev, model_name = (db, gguf), str(hf)
+    load_config(args.server, *prev, args.load_timeout)
 
 if __name__ == "__main__":
     main()
