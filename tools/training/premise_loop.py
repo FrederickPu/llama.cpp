@@ -251,7 +251,7 @@ def main():
         print(f"extract round {rnd}", flush=True)
         for _ in range(args.extract_attempts):
             try:
-                run(["lake", "exe", "extract_data", str(entry)])
+                run(["lake", "exe", "extract_data", "--premises", str(entry)])
                 break
             except SystemExit:
                 continue

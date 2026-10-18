@@ -1,0 +1,38 @@
+# Local have-drafter scaling grid: Qwen3-0.6B on Mathlib/Order, one 12 GB GPU (~5 h).
+# Run:    .venv/Scripts/python drafter_scaling.py configs/drafter-local.toml
+# Report: .venv/Scripts/python drafter_scaling.py configs/drafter-local.toml --report
+
+# Drafts are extracted from these .lean files (a file, directory, or .txt of paths; relative to tools/training).
+entry = ".lake/packages/mathlib/Mathlib/Order"
+# Never trained on; heldout_loss and heldout_acc are measured on these files' drafts.
+heldout = [
+    ".lake/packages/mathlib/Mathlib/Order/Filter/AtTopBot/BigOperators.lean",
+    ".lake/packages/mathlib/Mathlib/Order/Filter/AtTopBot/Prod.lean",
+    ".lake/packages/mathlib/Mathlib/Order/Filter/Cofinite.lean",
+    ".lake/packages/mathlib/Mathlib/Order/Filter/CountableInter.lean",
+    ".lake/packages/mathlib/Mathlib/Order/Filter/CountableSeparatingOn.lean",
+    ".lake/packages/mathlib/Mathlib/Order/Filter/EventuallyConst.lean",
+    ".lake/packages/mathlib/Mathlib/Order/Filter/Extr.lean",
+    ".lake/packages/mathlib/Mathlib/Order/Filter/Prod.lean",
+    ".lake/packages/mathlib/Mathlib/Order/Filter/Ultrafilter/Basic.lean",
+]
+# Results (results.jsonl) and per-point adapters/checks go here.
+out = "D:/llama-training/drafter"
+
+# Grid: every model x every size. Sizes are training drafts, capped at what the pool has;
+# each is the first n of one seeded shuffle, so smaller sets are subsets of larger ones.
+sizes = [125, 250, 500, 1000, 2000, 4000]
+
+# Fixed for every point, so only model size and data size vary.
+epochs = 3
+lr = 5e-4
+lora_r = 64
+seed = 0
+max_len = 4096    # examples longer than this (prompt + target tokens) are dropped
+eval_train = 200  # trained drafts sampled for train_acc; every held-out draft is checked
+
+# Instruct models: Base models never trained the chat/tool special tokens, and LoRA can't fix that.
+# batch_tokens: padded tokens per micro-batch; accum: micro-batches per optimizer step.
+[models."Qwen/Qwen3-0.6B"]
+batch_tokens = 8192
+accum = 1

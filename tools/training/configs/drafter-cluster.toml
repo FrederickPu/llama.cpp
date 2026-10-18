@@ -1,0 +1,52 @@
+# Cluster have-drafter scaling grid: Qwen3 0.6B-8B on all of Mathlib, one 80 GB GPU per run.
+# Same experiment as drafter-local.toml, scaled up in model size and data size.
+# Run:    python drafter_scaling.py configs/drafter-cluster.toml
+# Report: python drafter_scaling.py configs/drafter-cluster.toml --report
+
+# Drafts are extracted from these .lean files (a file, directory, or .txt of paths; relative to tools/training).
+entry = ".lake/packages/mathlib/Mathlib"
+# Never trained on; heldout_loss and heldout_acc are measured on these files' drafts.
+# The same 9 files as the local run, so its numbers are directly comparable.
+heldout = [
+    ".lake/packages/mathlib/Mathlib/Order/Filter/AtTopBot/BigOperators.lean",
+    ".lake/packages/mathlib/Mathlib/Order/Filter/AtTopBot/Prod.lean",
+    ".lake/packages/mathlib/Mathlib/Order/Filter/Cofinite.lean",
+    ".lake/packages/mathlib/Mathlib/Order/Filter/CountableInter.lean",
+    ".lake/packages/mathlib/Mathlib/Order/Filter/CountableSeparatingOn.lean",
+    ".lake/packages/mathlib/Mathlib/Order/Filter/EventuallyConst.lean",
+    ".lake/packages/mathlib/Mathlib/Order/Filter/Extr.lean",
+    ".lake/packages/mathlib/Mathlib/Order/Filter/Prod.lean",
+    ".lake/packages/mathlib/Mathlib/Order/Filter/Ultrafilter/Basic.lean",
+]
+# Results (results.jsonl) and per-point adapters/checks go here (relative to the working directory).
+out = "out/drafter-cluster"
+
+# Grid: every model x every size. Sizes are training drafts, capped at what the pool has
+# (all of Mathlib should give roughly 300k); smaller sets are subsets of larger ones.
+sizes = [1000, 4000, 16000, 64000, 256000]
+
+# Fixed for every point, as in the local run.
+epochs = 3
+lr = 5e-4
+lora_r = 64
+seed = 0
+max_len = 4096    # examples longer than this (prompt + target tokens) are dropped
+eval_train = 500  # trained drafts sampled for train_acc; every held-out draft is checked
+
+# batch_tokens: padded tokens per micro-batch; accum: micro-batches per optimizer step.
+# Effective batch is 8192 tokens, as in the local run, so the recipe is identical; fits one 80 GB GPU.
+[models."Qwen/Qwen3-0.6B"]
+batch_tokens = 8192
+accum = 1
+
+[models."Qwen/Qwen3-1.7B"]
+batch_tokens = 8192
+accum = 1
+
+[models."Qwen/Qwen3-4B"]
+batch_tokens = 8192
+accum = 1
+
+[models."Qwen/Qwen3-8B"]
+batch_tokens = 8192
+accum = 1

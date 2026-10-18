@@ -8,9 +8,19 @@ import Training.Basic
 open Lean Meta Elab Tactic
 open Canonical2 hiding Premise getKind
 
-def EXTRACT_DRAFTS : Bool := false
 def EXTRACT_AUTOMATION : Bool := false
-def EXTRACT_LLM : Bool := false
+
+/-- Set by `--drafts`: write `.drafts.jsonl` training data. -/
+initialize EXTRACT_DRAFTS : IO.Ref Bool ← IO.mkRef false
+/-- Set by `--checkAccuracy`: ask the drafter at `daemonPort` for each have and write `.checks.jsonl`. -/
+initialize CHECK_ACCURACY : IO.Ref Bool ← IO.mkRef false
+/-- Set by `--premises`: run premise selection and write `.premises.jsonl`. -/
+initialize EXTRACT_PREMISES : IO.Ref Bool ← IO.mkRef false
+
+/-- Set by `--checkKeys=<file>`: only check drafts whose `[goal, type]` is a line of the file. -/
+initialize CHECK_KEYS : IO.Ref (Option (Std.HashSet String)) ← IO.mkRef none
+
+def checkKey (goal type : String) : String := (Json.arr #[Json.str goal, Json.str type]).compress
 
 initialize draftStats : IO.Ref (Nat × Nat) ← IO.mkRef (0, 0)
 
@@ -139,6 +149,7 @@ def goalCopy (goal : MVarId) : MetaM MVarId := do
 
 
 def premise (range : Position × Position) (filepath : System.FilePath) (prevEnv : Environment) (tactic : String) (original : MVarId) (premises : Array Name) : MetaM Premise := do
+  unless ← EXTRACT_PREMISES.get do return { goal := "", tactic, premises := #[], negativePremises := #[] }
   let original ← (← original.clone).exposeNames
   let ranked := (← LibrarySuggestions.select original { maxSuggestions := 30 }).map (·.name)
   let result := {
@@ -180,22 +191,89 @@ structure DraftCheck where
   defeq : Bool
 deriving ToJson
 
+def isDuplicate (goal : MVarId) (type : Expr) : MetaM Bool := goal.withContext do
+  try checkDuplicate goal type; return false catch _ => return true
+
+/-- TEMPORARY: `Canonical2.elabStringAsExpr`, but with the goal's universe names in scope, so
+types like `Type u_1` elaborate. Remove (with `generate'`) once CanonicalLean does this. -/
+def elabStringAsExpr' (mvar : MVarId) (str : String) (type : Option Expr := none) : MetaM Expr := do
+  let stx ← IO.ofExcept (Parser.runParserCategory (← getEnv) `term str)
+  let mut lvls : CollectLevelParams.State := collectLevelParams {} (← mvar.getType)
+  for decl in ← getLCtx do lvls := collectLevelParams lvls decl.type
+  Term.TermElabM.run' do Term.withLevelNames lvls.params.toList do Term.withoutErrToSorry do
+    Term.elabTermAndSynthesize stx type
+
+/-- TEMPORARY: verbatim copy of `Canonical2.generate`, except it calls `elabStringAsExpr'`. -/
+def generate' (log : String → String → IO Unit) (mvar : MVarId) (premises : Array Name)
+  (provider : Provider) (config : LLMConfig := defaultConfig provider)
+  (retries := if config.temperature == 0.0 then 1 else 3) (wait : UInt32 := 0) (stall := 0)
+  (prompt : String := "") : MetaM (MetaTask RolloutSubgoal) := mvar.withContext do
+  let llmRef : IO.Ref (Option (CancelableTask (Except IO.Error Response))) ← IO.mkRef none
+  MetaM.toTask (cancel := do if let some t ← llmRef.get then t.cancel) do
+    log "generate" ""
+    IO.sleep wait
+    if ← IO.checkCanceled then throwError "canceled."
+    let start ← IO.monoMsNow
+    let goal ← Meta.ppGoal mvar
+    let premisesString ← premisesString premises[:12]
+    let hyps : Array String := (← getLCtx).foldr (init := #[]) fun decl acc =>
+      if decl.isImplementationDetail then acc else acc.push decl.userName.toString
+    let tools := subgoalTools hyps provider
+    let constrained := !provider matches .Llama _ && !provider matches .Vllm _ _
+    let mut messages := subgoalPrompt goal.pretty premisesString provider
+    unless prompt.isEmpty do messages := messages.push { role := "user", content := prompt }
+    let mut session : Option String := none
+    let mut error := ""
+    for _ in [0:retries] do
+      log "prefill" goal.pretty
+      log "error" error
+      let task ← llm log provider config messages tools constrained session
+      llmRef.set (some task)
+      let response ← IO.ofExcept task.task.get
+      llmRef.set none
+      if ← IO.checkCanceled then throwError "canceled."
+      messages := messages.push response.message
+      session := session <|> response.session
+      let some tc := response.message.tool_calls[0]? |
+        error := s!"No tool call. Retrying…"
+        messages := messages.push { role := "user", content := "You must use the \"have\" tool." }
+        continue
+      try
+        let args : Have ← IO.ofExcept (Json.parse tc.function.arguments >>= fromJson?)
+        let type ← elabStringAsExpr' mvar args.type
+        checkDuplicate mvar type
+        let h ← addSubgoal mvar args.name.toName type (args.clear.map (·.toName))
+        IO.sleep (stall + start - (← IO.monoMsNow)).toUInt32
+        return ⟨mvar, ← getMVarsNoDelayed (← instantiateMVars (.mvar mvar)), h, args.name.toName, type, args.type, messages, tools⟩
+      catch e =>
+        error ← e.toMessageData.toString
+        messages := messages.push { role := "tool", tool_call_id := tc.id, content := error }
+    throwError "generate failed."
+
+/-- Ask the drafter at `daemonPort` for a subgoal with Canonical's `generate` (via `generate'`; greedy, one attempt)
+and record whether it is defeq to the extracted one. Uses the same goal and premises as `draft`. -/
 def checkDraft (filepath : System.FilePath) (range : Position × Position) (tactic : String)
     (goal : MVarId) (desired : Expr) (premises : Array Name) : MetaM Unit := do
-  unless EXTRACT_LLM do return
+  unless ← CHECK_ACCURACY.get do return
+  let goal ← (← goal.clone).exposeNames
+  -- `draft` drops duplicates of a hypothesis, so they have no training examples.
+  if ← isDuplicate goal desired then return
   let goalString := (← Meta.ppGoal goal).pretty
   let typeString ← pp desired
+  if let some keys ← CHECK_KEYS.get then
+    unless keys.contains (checkKey goalString typeString) do return
   let rendered ← premises.filterMapM renderPremise
   let checksFile := ((← IO.FS.realPath filepath).toString.dropSuffix ".lean").toString ++ ".checks.jsonl"
   let provider : Provider := .Llama s!"http://{daemonHost}:{daemonPort}/chat/completions"
+  let lastError ← IO.mkRef ""
+  let log := fun kind msg => if kind == "error" && !msg.isEmpty then lastError.set msg else pure ()
   let (hit, generated, tag) ← try
-    let task ← generate (fun _ _ => pure ()) goal premises provider
+    let task ← generate' log goal premises provider { defaultConfig provider with temperature := 0.0 }
     match task.task.get with
-    | .error e => pure (false, s!"{e}", "(error)")
+    | .error e => pure (false, s!"{e}: {← lastError.get}", "(error)")
     | .ok (subgoal, _, sMeta) =>
       let eq ← goal.withContext do withMCtx sMeta.mctx do isDefEqGuarded subgoal.type desired
-      let generated ← goal.withContext do withMCtx sMeta.mctx do pp subgoal.type
-      pure (eq, generated, if eq then "(defeq)" else "(mismatch)")
+      pure (eq, subgoal.typeString, if eq then "(defeq)" else "(mismatch)")
   catch e =>
     pure (false, s!"{← e.toMessageData.toString}", "(error)")
   draftStats.modify fun (h, n) => (h + if hit then 1 else 0, n + 1)
@@ -203,11 +281,13 @@ def checkDraft (filepath : System.FilePath) (range : Position × Position) (tact
     tactic, goal := goalString, type := typeString, generated,
     premises := rendered, defeq := hit
   } : DraftCheck)
-  printFlush s!"{range}: {tactic} {tag}\n"
+  printFlush s!"{range}: {tactic} {tag}
+"
 
+/-- A training example in `generate`'s format: its prompt and tools, answered by a `have` call. -/
 def draft (tacticText : String) (name : String) (goal : MVarId) (type : Expr)
-  (kind : Kind) (removals : Array FVarId) : MetaM (Option HaveDraft) := do
-  unless EXTRACT_DRAFTS do return none
+  (kind : Kind) (removals : Array FVarId) (premises : Array Name) : MetaM (Option HaveDraft) := do
+  unless ← EXTRACT_DRAFTS.get do return none
   let goal ← (← goal.clone).exposeNames
   goal.withContext do try
     let _ ← checkDuplicate goal type
@@ -227,7 +307,7 @@ def draft (tacticText : String) (name : String) (goal : MVarId) (type : Expr)
         ]).compress
       }
     }
-    let messages := (subgoalPrompt goalString "" (Provider.Llama "")).push {
+    let messages := (subgoalPrompt goalString (← premisesString premises[:12]) (Provider.Llama "")).push {
       role := "assistant", content := "", tool_calls := #[toolCall]
     }
     let tools := subgoalTools hyps (Provider.Llama "")
@@ -267,7 +347,7 @@ def haveDrafts (range : Position × Position) (filepath : System.FilePath) (prev
           let (draft, fvar, goal', premise) ← goal.withContext do
             checkDraft filepath range tacticText goal replaced constants.toArray
             let name ← disambiguate (desiredName h.userName tacticText)
-            let draft ← draft tacticText name goal replaced .hypothesis (removals.map (·.fvarId))
+            let draft ← draft tacticText name goal replaced .hypothesis (removals.map (·.fvarId)) constants.toArray
             let (fvar, goal') ← goal.note name.toName (← Meta.mkSorry replaced false) replaced
             let premise ← premise range filepath prevEnv tacticText (← mkFreshExprMVar replaced).mvarId! constants.toArray
             pure (draft, fvar, goal', premise)
@@ -292,7 +372,7 @@ def haveDrafts (range : Position × Position) (filepath : System.FilePath) (prev
       let gAfterName := ((← getMCtx).getDecl gAfter).userName
       let name ← disambiguate (desiredName gAfterName tacticText)
       let goal' := (← goal.note name.toName (← Meta.mkSorry imp false) imp).2
-      let draft ← draft tacticText name goal imp .goal (removals.map (·.fvarId))
+      let draft ← draft tacticText name goal imp .goal (removals.map (·.fvarId)) constants.toArray
       pure (draft, goal')
 
     if let .some draft := draft then
@@ -423,8 +503,8 @@ partial def processSnapshot (ctx : ExtractCtx)
     let trees := snap.elabSnap.infoTreeSnap.get.infoTree?.toList
     let (drafts, premises) ← trees.foldlM (init := (#[], #[])) fun acc t => do
       return acc ++ (← processInfoTree ctx.fileName prevEnv t).1
-    if EXTRACT_DRAFTS then for draft in drafts do appendJsonl ctx.draftsFile draft
-    for premise in premises do
+    if ← EXTRACT_DRAFTS.get then for draft in drafts do appendJsonl ctx.draftsFile draft
+    if ← EXTRACT_PREMISES.get then for premise in premises do
       appendJsonl ctx.premisesFile premise
       let pos := premise.premises.size
       unless pos == 0 do
@@ -435,14 +515,24 @@ partial def processSnapshot (ctx : ExtractCtx)
     processSnapshot ctx next.task.get snap.elabSnap.resultSnap.get.cmdState.env (idx + 1)
 
 unsafe def main (args : List String) : IO Unit := do
-  let [entry] := args |
-    IO.println "Usage: extract_data <entry_directory>"
+  let flags := args.filter (·.startsWith "--")
+  let [entry] := args.filter (!·.startsWith "--") |
+    IO.println "Usage: extract_data [--premises] [--drafts] [--checkAccuracy [--checkKeys=<file>]] <entry>"
     return
+  EXTRACT_PREMISES.set (flags.contains "--premises")
+  EXTRACT_DRAFTS.set (flags.contains "--drafts")
+  CHECK_ACCURACY.set (flags.contains "--checkAccuracy")
+  if let some path := flags.findSome? (·.dropPrefix? "--checkKeys=") then
+    -- Lines are JSON `[goal, type]`; re-encode so the keys don't depend on the writer's escaping.
+    let lines := (← IO.FS.readFile path.toString).splitOn "
+" |>.filter (!·.trimAscii.isEmpty)
+    let keys ← lines.mapM fun line => IO.ofExcept do
+      let (g, t) ← fromJson? (α := String × String) (← Json.parse line)
+      return checkKey g t
+    CHECK_KEYS.set (some (Std.HashSet.ofList keys))
 
   Lean.initSearchPath (← Lean.findSysroot)
   enableInitializersExecution
-  if EXTRACT_LLM then
-    startSubgoalDaemon (fun _ _ => pure ())
   let mut state := {}
   let mut tasks := []
   let mut i := 0
@@ -488,7 +578,7 @@ unsafe def main (args : List String) : IO Unit := do
   for task in tasks do
     let _ ← task.get
 
-  if EXTRACT_LLM then
+  if ← CHECK_ACCURACY.get then
     let (hit, n) ← draftStats.get
     IO.println s!"draft accuracy {hit}/{n}"
   IO.println "Done processing all files"
