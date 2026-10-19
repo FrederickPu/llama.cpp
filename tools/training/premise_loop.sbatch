@@ -16,11 +16,11 @@
 #   ENTRY=.lake/packages/mathlib/Mathlib/Order/Defs sbatch --time=2:00:00 premise_loop.sbatch --rounds 1 --out out/smoke
 # The job requeues itself near the time limit and resumes from --out.
 #
-# One-time setup on a login node (lake itself runs in the job):
+# One-time setup: `lake exe cache get` in tools/training on a compute node (login nodes limit threads), and on a login node:
 #   curl -sSf https://elan.lean-lang.org/elan-init.sh | sh -s -- -y --default-toolchain none
-#   python3 -m venv ~/venvs/premise && source ~/venvs/premise/bin/activate
+#   python3 -m venv ~/venvs/premise && source ~/venvs/premise/bin/activate  # Python 3.10+
 #   pip install torch  # not requirements-convert_hf_to_gguf.txt, which pins the CPU wheel
-#   pip install transformers==4.57.6 huggingface_hub safetensors sentencepiece protobuf numpy pyyaml tqdm
+#   pip install transformers==4.57.6 huggingface_hub safetensors sentencepiece protobuf numpy pyyaml tqdm requests
 
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
@@ -31,7 +31,6 @@ export PATH="$HOME/.elan/bin:$PATH" PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=fa
 # Lean starts a worker per core on the node, not per core allocated to the job
 export LEAN_NUM_THREADS="$SLURM_CPUS_PER_TASK"
 
-lake exe cache get
 lake build extract_data
 
 # Canonical hardcodes the premise server to 127.0.0.1:8766, so two jobs on one node would share it

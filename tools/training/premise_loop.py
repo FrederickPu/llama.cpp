@@ -275,7 +275,7 @@ def main():
     p.add_argument("--server", default=SERVER)
     p.add_argument("--model", help="HF model to start from (default: the premise server's GGUF)")
     p.add_argument("--out", default=str(LOOP / "out/training"))
-    for name, default in [("rounds", 2), ("epochs", 1), ("batch-size", 16), ("n-neg", 8), ("extract-attempts", 5), ("load-timeout", 600), ("save-every", 1000)]:
+    for name, default in [("rounds", 2), ("epochs", 1), ("batch-size", 16), ("n-neg", 3), ("extract-attempts", 5), ("load-timeout", 600), ("save-every", 1000)]:
         p.add_argument("--" + name, type=int, default=default)
     args = p.parse_args()
     start_premise(args.server)
