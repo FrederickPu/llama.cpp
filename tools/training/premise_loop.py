@@ -4,10 +4,11 @@
     python tools/training/premise_loop.py [ENTRY]
     # ENTRY: .lean file, directory, or .txt of paths (default Mathlib/Order/Defs/LinearOrder.lean)
     # Starts premise-server if it is down. Later rounds swap model and db with PUT /config.
-    # Flags: --rounds --epochs --batch-size --n-neg --model --out --extract-attempts --load-timeout --save-every
+    # Flags: --rounds --epochs --batch-size --n-neg --lr --lr-later --model --out --extract-attempts --load-timeout --save-every
     # Rerun the same command to resume: finished rounds are skipped and training continues from its checkpoint.
+    # Training uses every visible CUDA GPU; --batch-size is per GPU.
 """
-import argparse, json, os, random, shutil, subprocess, sys, tarfile, time, urllib.error, urllib.request, zipfile
+import argparse, json, os, random, shutil, socket, subprocess, sys, tarfile, time, urllib.error, urllib.request, zipfile
 from pathlib import Path
 import torch
 import torch.nn.functional as F
@@ -20,7 +21,7 @@ CONVERT = LLAMA / "convert_hf_to_gguf.py"
 # base model is rebuilt from the premise server's GGUF on top of its architecture repo.
 ARCH_MODEL = "sentence-transformers/all-distilroberta-v1"
 SERVER = "http://127.0.0.1:8766"
-LR, TEMP, MAX_LEN, WARMUP = 2e-5, 0.05, 512, 0.1
+TEMP, MAX_LEN, WARMUP = 0.05, 512, 0.1
 
 def lean_files(entry: Path) -> list[Path]:
     if entry.is_dir():
@@ -56,57 +57,92 @@ def copy_pooling(src, dst: Path):
         if path.is_dir() and mod.get("path"):
             shutil.copytree(path, dst / path.name, dirs_exist_ok=True)
 
-def train(model_name, rows, out_dir, epochs, batch_size, n_neg, save_every):
+def train(model_name, data, out_dir, epochs, batch_size, n_neg, save_every, lr):
+    """Train on every visible CUDA GPU (one process each), else on the one available device."""
+    world = torch.cuda.device_count() if pick_device() == "cuda" else 1
+    args = (model_name, data, out_dir, epochs, batch_size, n_neg, save_every, lr)
+    if world > 1:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            init = f"tcp://127.0.0.1:{s.getsockname()[1]}"
+        print(f"training on {world} GPUs", flush=True)
+        torch.multiprocessing.spawn(train_worker, (world, init) + args, nprocs=world)
+    else:
+        train_worker(0, 1, None, *args)
+    return out_dir / "hf"
+
+def train_worker(rank, world, init, model_name, data, out_dir, epochs, batch_size, n_neg, save_every, lr):
+    kind = device = pick_device()
+    if world > 1:
+        torch.distributed.init_process_group("nccl" if kind == "cuda" else "gloo", init_method=init, rank=rank, world_size=world)
+        if kind == "cuda":
+            torch.cuda.set_device(rank)
+            device = f"cuda:{rank}"
+    log = print if rank == 0 else (lambda *a, **k: None)
     tok = AutoTokenizer.from_pretrained(model_name)
     model = AutoModel.from_pretrained(model_name)
-    device = pick_device()
     model.to(device).train()
+    # the pooler is unused by mean pooling, so it never has a gradient on any rank
+    params = [p for name, p in model.named_parameters() if not name.startswith("pooler.")]
     examples = [
         (row["goal"], pos, (row["negativePremises"] * n_neg)[:n_neg])
-        for row in rows if row["premises"] and row["negativePremises"]
+        for row in jsonl(data) if row["premises"] and row["negativePremises"]
         for pos in row["premises"]
     ]
     if not examples:
         raise SystemExit("no premise pairs")
-    steps_per_epoch = -(-len(examples) // batch_size)
+    global_batch = batch_size * world
+    steps_per_epoch = -(-len(examples) // global_batch)
     total_steps = epochs * steps_per_epoch
-    opt = torch.optim.AdamW(model.parameters(), lr=LR)
+    opt = torch.optim.AdamW(model.parameters(), lr=lr)
     sched = get_linear_schedule_with_warmup(opt, int(WARMUP * total_steps), total_steps)
     ckpt, start = out_dir / "checkpoint.pt", 0
     if ckpt.is_file():
         state = torch.load(ckpt, map_location=device)
         model.load_state_dict(state["model"]); opt.load_state_dict(state["opt"]); sched.load_state_dict(state["sched"])
         start = state["step"]
-        print(f"resume from step {start}/{total_steps}", flush=True)
+        log(f"resume from step {start}/{total_steps}", flush=True)
     for epoch in range(start // steps_per_epoch, epochs):
         # seeded per epoch so a resumed run replays the same batch order
         order = list(range(len(examples)))
         random.Random(epoch).shuffle(order)
         total, steps = 0.0, 0
         for b in range(max(start - epoch * steps_per_epoch, 0), steps_per_epoch):
-            batch = [examples[j] for j in order[b * batch_size:(b + 1) * batch_size]]
-            with torch.autocast(device, dtype=torch.bfloat16, enabled=device == "cuda"):
-                q = embed(model, tok, [g for g, _, _ in batch], device)
-                p = embed(model, tok, [p for _, p, _ in batch], device)
-                n = embed(model, tok, [t for *_, ns in batch for t in ns], device).view(len(batch), n_neg, -1)
-                scores = torch.cat([(q * p).sum(-1, keepdim=True), torch.einsum("bd,bkd->bk", q, n)], 1)
-                loss = F.cross_entropy(scores.float() / TEMP, torch.zeros(len(batch), dtype=torch.long, device=device))
-            opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step(); sched.step()
-            total += float(loss); steps += 1
+            batch = [examples[j] for j in order[b * global_batch:(b + 1) * global_batch][rank::world]]
+            opt.zero_grad()
+            if batch:  # empty only on an epoch's last step, when fewer examples than GPUs remain
+                with torch.autocast(kind, dtype=torch.bfloat16, enabled=kind == "cuda"):
+                    q = embed(model, tok, [g for g, _, _ in batch], device)
+                    p = embed(model, tok, [p for _, p, _ in batch], device)
+                    n = embed(model, tok, [t for *_, ns in batch for t in ns], device).view(len(batch), n_neg, -1)
+                    scores = torch.cat([(q * p).sum(-1, keepdim=True), torch.einsum("bd,bkd->bk", q, n)], 1)
+                    loss = F.cross_entropy(scores.float() / TEMP, torch.zeros(len(batch), dtype=torch.long, device=device))
+                loss.backward()
+                total += float(loss); steps += 1
+            if world > 1:
+                # one all-reduce per step keeps every replica's update identical
+                flat = torch.cat([(p.grad if p.grad is not None else torch.zeros_like(p)).reshape(-1) for p in params])
+                torch.distributed.all_reduce(flat)
+                flat /= world
+                for p, g in zip(params, flat.split([p.numel() for p in params])):
+                    p.grad = g.view_as(p)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step(); sched.step()
             step = epoch * steps_per_epoch + b + 1
-            if step % save_every == 0 and step < total_steps:
+            if rank == 0 and step % save_every == 0 and step < total_steps:
                 part = ckpt.with_name(ckpt.name + ".part")
                 torch.save({"model": model.state_dict(), "opt": opt.state_dict(), "sched": sched.state_dict(), "step": step}, part)
                 part.replace(ckpt)
-                print(f"step {step}/{total_steps} loss {total / steps:.4f} lr {sched.get_last_lr()[0]:.2e}", flush=True)
-        print(f"epoch {epoch + 1} loss {total / steps:.4f}", flush=True)
-    out, part = out_dir / "hf", out_dir / "hf.part"
-    shutil.rmtree(part, ignore_errors=True)
-    model.save_pretrained(part); tok.save_pretrained(part)
-    copy_pooling(model_name, part)
-    part.rename(out)
-    ckpt.unlink(missing_ok=True)
-    return out
+                log(f"step {step}/{total_steps} loss {total / max(steps, 1):.4f} lr {sched.get_last_lr()[0]:.2e}", flush=True)
+        log(f"epoch {epoch + 1} loss {total / max(steps, 1):.4f}", flush=True)
+    if rank == 0:
+        out, part = out_dir / "hf", out_dir / "hf.part"
+        shutil.rmtree(part, ignore_errors=True)
+        model.save_pretrained(part); tok.save_pretrained(part)
+        copy_pooling(model_name, part)
+        part.rename(out)
+        ckpt.unlink(missing_ok=True)
+    if world > 1:
+        torch.distributed.destroy_process_group()
 
 def to_gguf(hf, gguf: Path):
     part = gguf.with_name(gguf.name + ".part")
@@ -242,16 +278,18 @@ def server_up(url: str) -> bool:
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
         return False
 
-def start_premise(url: str):
+def start_premise(url: str, log: Path):
     if server_up(url):
         return
     host, port = "127.0.0.1", url.rsplit(":", 1)[-1].split("/")[0]
     exe, model = ensure_llama(), ensure_premise_model()
     args = [str(exe), "--premise", "-m", str(model), "--host", host, "--port", port,
             "--pooling", "mean", "--ctx-size", "512"]
-    print("starting premise server", flush=True)
+    print(f"starting premise server, log {log}", flush=True)
     flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
-    subprocess.Popen(args, cwd=exe.parent, creationflags=flags, close_fds=True)
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with open(log, "ab") as out:
+        subprocess.Popen(args, cwd=exe.parent, creationflags=flags, close_fds=True, stdout=out, stderr=subprocess.STDOUT)
     for _ in range(240):
         if server_up(url):
             return
@@ -260,12 +298,12 @@ def start_premise(url: str):
 
 def run(cmd):
     print("+", " ".join(cmd), flush=True)
-    proc = subprocess.Popen(cmd, cwd=LOOP)
+    proc, start = subprocess.Popen(cmd, cwd=LOOP), time.monotonic()
     while proc.poll() is None:
         try:
-            proc.wait(15)
+            proc.wait(600)
         except subprocess.TimeoutExpired:
-            print("still running", flush=True)
+            print(f"{cmd[0]} still running after {(time.monotonic() - start) / 60:.0f} min", flush=True)
     if proc.returncode:
         raise SystemExit(f"{cmd[0]} failed ({proc.returncode})")
 
@@ -274,11 +312,14 @@ def main():
     p.add_argument("entry", nargs="?", default=str(LOOP / ".lake/packages/mathlib/Mathlib/Order/Defs/LinearOrder.lean"))
     p.add_argument("--server", default=SERVER)
     p.add_argument("--model", help="HF model to start from (default: the premise server's GGUF)")
+    # training from a general-purpose model needs larger steps than refining a premise selector
+    p.add_argument("--lr", type=float, help="first-round learning rate (default: 1e-4 with --model, else 2e-5)")
+    p.add_argument("--lr-later", type=float, default=2e-5, help="learning rate for later rounds, which refine the previous round")
     p.add_argument("--out", default=str(LOOP / "out/training"))
     for name, default in [("rounds", 2), ("epochs", 1), ("batch-size", 16), ("n-neg", 3), ("extract-attempts", 5), ("load-timeout", 600), ("save-every", 1000)]:
         p.add_argument("--" + name, type=int, default=default)
     args = p.parse_args()
-    start_premise(args.server)
+    start_premise(args.server, Path(args.out) / "premise-server.log")
     if not (LOOP / ".lake/packages/Canonical/lakefile.lean").is_file():
         print("lake update (mathlib clone is large and quiet)", flush=True)
         run(["lake", "update"])
@@ -299,7 +340,7 @@ def main():
                 print(f"extract round {rnd}", flush=True)
                 for _ in range(args.extract_attempts):
                     try:
-                        run(["lake", "exe", "extract_data", str(entry)])
+                        run(["lake", "-q", "exe", "extract_data", str(entry)])
                         break
                     except SystemExit:
                         continue
@@ -312,7 +353,8 @@ def main():
                 part.write_text("".join(json.dumps(row) + "\n" for row in rows))
                 part.replace(data)
             if not hf.is_dir():
-                train(model_name, jsonl(data), round_dir, args.epochs, args.batch_size, args.n_neg, args.save_every)
+                lr = (args.lr or (1e-4 if args.model else 2e-5)) if rnd == 0 else args.lr_later
+                train(model_name, data, round_dir, args.epochs, args.batch_size, args.n_neg, args.save_every, lr)
             # before the gguf exists, so a finished round never leaves stale extraction behind
             for lean in files:
                 for suffix in (".extract.jsonl", ".extract.jsonl.tmp", ".premises.jsonl"):

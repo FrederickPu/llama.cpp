@@ -2,9 +2,9 @@
 #SBATCH --job-name=premise-loop
 #SBATCH --partition=general
 #SBATCH --time=2-00:00:00         # check the partition limit: sinfo -p general -o "%l"
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:4              # training uses every GPU; on the lab partition: -p l3lab --qos=l3lab_qos
 #SBATCH --cpus-per-task=16        # extract_data elaborates 8 files at once
-#SBATCH --mem=128G                # training holds all of premises.jsonl in memory
+#SBATCH --mem=256G                # each GPU's process holds all of premises.jsonl in memory
 #SBATCH --output=%x-%j.out
 #SBATCH --open-mode=append        # a requeued run appends to the same log
 #SBATCH --requeue
@@ -31,7 +31,7 @@ export PATH="$HOME/.elan/bin:$PATH" PYTHONUNBUFFERED=1 TOKENIZERS_PARALLELISM=fa
 # Lean starts a worker per core on the node, not per core allocated to the job
 export LEAN_NUM_THREADS="$SLURM_CPUS_PER_TASK"
 
-lake build extract_data
+lake -q build extract_data
 
 # Canonical hardcodes the premise server to 127.0.0.1:8766, so two jobs on one node would share it
 if curl -sf --max-time 2 http://127.0.0.1:8766/health > /dev/null; then
