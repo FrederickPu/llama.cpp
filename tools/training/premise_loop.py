@@ -283,8 +283,12 @@ def start_premise(url: str, log: Path):
         return
     host, port = "127.0.0.1", url.rsplit(":", 1)[-1].split("/")[0]
     exe, model = ensure_llama(), ensure_premise_model()
+    # llama.cpp sizes its pool to every core on the node, not the job's share, and its spinning
+    # threads would starve extract_data; with the model on the GPU a few threads are plenty
+    cores = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else os.cpu_count()
+    threads = str(min(4, cores))
     args = [str(exe), "--premise", "-m", str(model), "--host", host, "--port", port,
-            "--pooling", "mean", "--ctx-size", "512"]
+            "--pooling", "mean", "--ctx-size", "512", "--threads", threads, "--threads-batch", threads]
     print(f"starting premise server, log {log}", flush=True)
     flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
     log.parent.mkdir(parents=True, exist_ok=True)
@@ -298,7 +302,9 @@ def start_premise(url: str, log: Path):
 
 def run(cmd):
     print("+", " ".join(cmd), flush=True)
-    proc, start = subprocess.Popen(cmd, cwd=LOOP), time.monotonic()
+    # extract_data survives the occasional Lean panic, but each one would print a ~100-line backtrace
+    env = {"LEAN_BACKTRACE": "0", **os.environ}
+    proc, start = subprocess.Popen(cmd, cwd=LOOP, env=env), time.monotonic()
     while proc.poll() is None:
         try:
             proc.wait(600)
