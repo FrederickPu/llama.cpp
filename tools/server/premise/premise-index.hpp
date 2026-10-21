@@ -2,9 +2,10 @@
 
 #include "premise-schema.hpp"
 
-#include <faiss/IndexFlat.h>
 #include <faiss/IndexIDMap.h>
+#include <faiss/IndexScalarQuantizer.h>
 #include <faiss/impl/IDSelector.h>
+#include <faiss/utils/fp16.h>
 #include <sqlite3.h>
 
 #include <algorithm>
@@ -345,11 +346,14 @@ private:
         }
 
         void bind_vector(int index, const std::vector<float> & value) {
-            const size_t bytes = value.size() * sizeof(float);
+            std::vector<uint16_t> half(value.size());
+            std::transform(value.begin(), value.end(), half.begin(),
+                    [](float x) { return faiss::encode_fp16(x); });
+            const size_t bytes = half.size() * sizeof(uint16_t);
             if (bytes > (size_t) std::numeric_limits<int>::max()) {
                 throw std::runtime_error("embedding is too large for SQLite");
             }
-            check(sqlite3_bind_blob(stmt, index, value.data(), (int) bytes, SQLITE_TRANSIENT));
+            check(sqlite3_bind_blob(stmt, index, half.data(), (int) bytes, SQLITE_TRANSIENT));
         }
 
         bool step() {
@@ -583,28 +587,23 @@ private:
     }
 
     static std::unique_ptr<faiss::IndexIDMap2> make_index(int dimensions) {
-        auto result = std::make_unique<faiss::IndexIDMap2>(new faiss::IndexFlatIP(dimensions));
+        auto result = std::make_unique<faiss::IndexIDMap2>(new faiss::IndexScalarQuantizer(
+                dimensions, faiss::ScalarQuantizer::QT_fp16, faiss::METRIC_INNER_PRODUCT));
         result->own_fields = true;
         return result;
     }
 
-    static void validate_stored_vector(const void * blob, int bytes, int dimensions) {
-        if (!blob || bytes != dimensions * (int) sizeof(float)) {
+    static void decode_stored_vector(const void * blob, int bytes, int dimensions, float * out) {
+        if (!blob || bytes != dimensions * (int) sizeof(uint16_t)) {
             throw std::runtime_error("stored embedding dimension mismatch");
         }
         const uint8_t * data = static_cast<const uint8_t *>(blob);
-        double norm_squared = 0.0;
         for (int i = 0; i < dimensions; ++i) {
-            float value;
-            std::memcpy(&value, data + (size_t) i * sizeof(float), sizeof(value));
-            if (!std::isfinite(value)) {
-                throw std::runtime_error("stored embedding contains a non-finite component");
-            }
-            norm_squared += (double) value * value;
+            uint16_t half;
+            std::memcpy(&half, data + (size_t) i * sizeof(half), sizeof(half));
+            out[i] = faiss::decode_fp16(half);
         }
-        if (!std::isfinite(norm_squared) || std::fabs(norm_squared - 1.0) > 1e-3) {
-            throw std::runtime_error("stored embedding is not approximately unit normalized");
-        }
+        validate_vector(out, dimensions, "stored embedding");
     }
 
     static BuiltIndex build_index(
@@ -632,11 +631,10 @@ private:
             if (state.rows.find(id) == state.rows.end() || !built.ids.insert(id).second) {
                 throw std::runtime_error("invalid declaration embedding ID");
             }
-            validate_stored_vector(blob, bytes, dimensions);
             ids.push_back(id);
             const size_t offset = embeddings.size();
             embeddings.resize(offset + (size_t) dimensions);
-            std::memcpy(embeddings.data() + offset, blob, (size_t) bytes);
+            decode_stored_vector(blob, bytes, dimensions, embeddings.data() + offset);
             if (ids.size() == batch_size) {
                 built.index->add_with_ids((faiss::idx_t) ids.size(), embeddings.data(), ids.data());
                 ids.clear();

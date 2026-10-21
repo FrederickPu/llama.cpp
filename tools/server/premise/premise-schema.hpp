@@ -2,7 +2,8 @@
 
 namespace premise_schema {
 
-inline constexpr int VERSION = 6;
+// embeddings are f16 BLOBs
+inline constexpr int VERSION = 7;
 
 inline constexpr const char * SQL = R"sql(
 CREATE TABLE IF NOT EXISTS premise_config(

@@ -139,10 +139,20 @@ jobs:
             -DGGML_NATIVE=OFF \
             -DGGML_CPU_ALL_VARIANTS=ON \
             -DGGML_VULKAN=ON \
+            "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc" \
+            "-DCMAKE_SHARED_LINKER_FLAGS=-static-libstdc++ -static-libgcc" \
             ${{ env.CMAKE_ARGS }}
           cmake --build build --config Release -j $(nproc)
           cmake --build build --config Release --target test-premise-index -j $(nproc)
           ./build/bin/test-premise-index
+
+      - name: Check libstdc++ is bundled
+        # systems with an older libstdc++ than the runner's (e.g. RHEL clusters) cannot load it
+        run: |
+          if readelf -d build/bin/* 2>/dev/null | grep -E 'NEEDED.*lib(stdc\+\+|gcc_s)\.so'; then
+            echo "binaries still load libstdc++ or libgcc_s dynamically"
+            exit 1
+          fi
 
       - name: Pack artifacts
         run: |

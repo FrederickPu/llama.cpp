@@ -205,8 +205,8 @@ int main() {
                     "could not inspect stored embedding");
             require(sqlite3_step(statement) == SQLITE_ROW &&
                     std::string(reinterpret_cast<const char *>(sqlite3_column_text(statement, 0))) == "blob" &&
-                    sqlite3_column_int(statement, 1) == 2 * (int) sizeof(float),
-                    "embedding was not stored as a float BLOB");
+                    sqlite3_column_int(statement, 1) == 2 * (int) sizeof(uint16_t),
+                    "embedding was not stored as an f16 BLOB");
             sqlite3_finalize(statement);
             require(sqlite3_prepare_v2(raw,
                     "SELECT schema_version FROM premise_config WHERE id = 1",
