@@ -2,21 +2,15 @@
 
 #include "premise-schema.hpp"
 
-#include <faiss/IndexIDMap.h>
-#include <faiss/IndexScalarQuantizer.h>
-#include <faiss/impl/IDSelector.h>
-#include <faiss/utils/fp16.h>
+#include "ggml.h"
+
 #include <sqlite3.h>
 
 #include <algorithm>
-#include <cctype>
 #include <cmath>
-#include <cstdint>
 #include <cstring>
-#include <list>
-#include <limits>
-#include <memory>
-#include <mutex>
+#include <functional>
+#include <queue>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -24,809 +18,287 @@
 #include <utility>
 #include <vector>
 
-struct PremiseIndex {
-    static_assert(sizeof(faiss::idx_t) == sizeof(int64_t));
-
-    struct Candidate {
+// The embeddings of every cached module's declarations: persisted in SQLite (as f16) and
+// held in memory (as f32) for exact search. Not thread-safe; the server serializes requests.
+struct premise_index {
+    struct decl {
         std::string name;
-        std::string module;
-        std::vector<float> embedding;
+        std::vector<float> embedding; // unit length
     };
 
-    struct Hit {
+    struct hit {
         std::string name;
-        std::string module;
-        float score = 0.0f;
+        float score;
     };
 
-    struct ModuleEntry {
-        std::string version_token;
-        std::vector<faiss::idx_t> declaration_ids;
-    };
-
-    using IndexedDeclaration = Candidate;
-
-    ~PremiseIndex() {
-        if (db) {
+    premise_index(const std::string & path, int dim) : dim(dim) {
+        if (sqlite3_open_v2(path.c_str(), &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) != SQLITE_OK) {
+            const std::string message = db ? sqlite3_errmsg(db) : "out of memory";
             sqlite3_close_v2(db);
+            throw std::runtime_error("cannot open premise database " + path + ": " + message);
         }
-    }
-
-    size_t size() const {
-        std::lock_guard<std::mutex> lock(mu);
-        require_db();
-        refresh_database_locked();
-        return rows.size();
-    }
-
-    int embedding_dim() const {
-        std::lock_guard<std::mutex> lock(mu);
-        require_db();
-        refresh_database_locked();
-        return dim;
-    }
-
-    bool find_local_embedding(const std::string & text, std::vector<float> & embedding) {
-        std::lock_guard<std::mutex> lock(local_cache_mu);
-        auto found = local_cache_index.find(text);
-        if (found == local_cache_index.end()) {
-            return false;
-        }
-        local_cache.splice(local_cache.begin(), local_cache, found->second);
-        embedding = found->second->second;
-        return true;
-    }
-
-    void cache_local_embedding(const std::string & text, const std::vector<float> & embedding) {
-        std::lock_guard<std::mutex> lock(local_cache_mu);
-        auto found = local_cache_index.find(text);
-        if (found != local_cache_index.end()) {
-            local_cache.splice(local_cache.begin(), local_cache, found->second);
-            found->second->second = embedding;
-            return;
-        }
-        local_cache.emplace_front(text, embedding);
-        local_cache_index.emplace(local_cache.front().first, local_cache.begin());
-        if (local_cache.size() > LOCAL_CACHE_CAPACITY) {
-            local_cache_index.erase(local_cache.back().first);
-            local_cache.pop_back();
-        }
-    }
-
-    void open(const std::string & path, int model_dim) {
-        std::lock_guard<std::mutex> lock(mu);
-        if (db) {
-            throw std::runtime_error("premise database is already open");
-        }
-        if (path.empty()) {
-            throw std::runtime_error("missing --index-db");
-        }
-        if (model_dim <= 0) {
-            throw std::runtime_error("invalid embedding dimension");
-        }
-        if (model_dim > std::numeric_limits<int>::max() / (int) sizeof(float)) {
-            throw std::runtime_error("embedding dimension is too large");
-        }
-        sqlite3 * opened = nullptr;
-        const int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX;
-        const int rc = sqlite3_open_v2(path.c_str(), &opened, flags, nullptr);
-        if (rc != SQLITE_OK) {
-            const std::string message = opened ? sqlite3_errmsg(opened) : "cannot allocate SQLite connection";
-            if (opened) {
-                sqlite3_close_v2(opened);
-            }
-            throw std::runtime_error("cannot open premise database: " + message);
-        }
-
-        db = opened;
-        dim = model_dim;
-        sqlite3_extended_result_codes(db, 1);
-        sqlite3_busy_timeout(db, 5000);
-
         try {
-            exec(db, "PRAGMA foreign_keys = ON");
-            exec(db, "PRAGMA journal_mode = WAL");
-            exec(db, "PRAGMA synchronous = FULL");
-            exec(db, "PRAGMA wal_autocheckpoint = 1000");
-            initialize_schema_locked();
-            refresh_database_locked(true);
+            exec("PRAGMA foreign_keys = ON");
+            init_schema();
+            load();
         } catch (...) {
             sqlite3_close_v2(db);
-            db = nullptr;
             throw;
         }
     }
 
-    std::string get_module_version(const std::string & module) const {
-        std::lock_guard<std::mutex> lock(mu);
-        require_db();
-        refresh_database_locked();
+    ~premise_index() {
+        sqlite3_close_v2(db);
+    }
+
+    premise_index(const premise_index &) = delete;
+    premise_index & operator=(const premise_index &) = delete;
+
+    // the module's version token, or "" if it is not cached
+    std::string version(const std::string & module) const {
         auto it = modules.find(module);
-        return it == modules.end() ? std::string() : it->second.version_token;
+        return it == modules.end() ? std::string() : it->second.token;
     }
 
-    std::vector<std::string> get_module_versions(const std::vector<std::string> & requested) const {
-        std::lock_guard<std::mutex> lock(mu);
-        require_db();
-        refresh_database_locked();
-        std::vector<std::string> versions;
-        versions.reserve(requested.size());
-        for (const auto & module : requested) {
-            auto it = modules.find(module);
-            versions.push_back(it == modules.end() ? std::string() : it->second.version_token);
-        }
-        return versions;
-    }
-
-    void replace_module(const std::string & module,
-                        const std::string & version_token,
-                        const std::vector<Candidate> & replacements) {
-        std::lock_guard<std::mutex> lock(mu);
-        require_db();
-        refresh_database_locked();
-
-        std::vector<const Candidate *> accepted;
-        accepted.reserve(replacements.size());
+    // make `decls` the module's declarations at `token`; empty and repeated names are dropped
+    void replace(const std::string & module, const std::string & token, const std::vector<decl> & decls) {
+        module_entry entry{token, {}, {}};
         std::unordered_set<std::string> seen;
-        for (const auto & candidate : replacements) {
-            if (candidate.name.empty() || !seen.insert(candidate.name).second) {
+        for (const auto & d : decls) {
+            if (d.name.empty() || !seen.insert(d.name).second) {
                 continue;
             }
-            validate_vector(candidate.embedding, dim, "embedding");
-            accepted.push_back(&candidate);
+            validate(d.embedding, "embedding");
+            entry.names.push_back(d.name);
+            entry.embeddings.insert(entry.embeddings.end(), d.embedding.begin(), d.embedding.end());
         }
 
-        std::vector<faiss::idx_t> new_ids;
-        for (;;) {
-            exec(db, "BEGIN IMMEDIATE");
-            try {
-                if (read_content_revision(db) != content_revision) {
-                    exec(db, "ROLLBACK");
-                    refresh_database_locked(true);
-                    continue;
-                }
-                if (content_revision == std::numeric_limits<int64_t>::max()) {
-                    throw std::runtime_error("premise database content revision is exhausted");
-                }
-                Statement delete_module(db, "DELETE FROM premise_modules WHERE module = ?1");
-                delete_module.bind_text(1, module);
-                delete_module.run();
-
-                Statement insert_module(db,
-                        "INSERT INTO premise_modules(module, version_token) VALUES(?1, ?2)");
-                insert_module.bind_text(1, module);
-                insert_module.bind_text(2, version_token);
-                insert_module.run();
-
-                Statement insert_declaration(db,
-                        "INSERT INTO premise_declarations(module, ordinal, name) VALUES(?1, ?2, ?3)");
-                Statement insert_embedding(db,
-                        "INSERT INTO premise_declaration_embeddings(declaration_id, embedding) VALUES(?1, ?2)");
-                new_ids.clear();
-                new_ids.reserve(accepted.size());
-                for (size_t i = 0; i < accepted.size(); ++i) {
-                    insert_declaration.bind_text(1, module);
-                    insert_declaration.bind_int64(2, checked_int64(i, "too many declarations"));
-                    insert_declaration.bind_text(3, accepted[i]->name);
-                    insert_declaration.run();
-                    insert_declaration.reset();
-
-                    const faiss::idx_t id = sqlite3_last_insert_rowid(db);
-                    if (id <= 0) {
-                        throw std::runtime_error("invalid premise declaration ID");
-                    }
-                    insert_embedding.bind_int64(1, id);
-                    insert_embedding.bind_vector(2, accepted[i]->embedding);
-                    insert_embedding.run();
-                    insert_embedding.reset();
-                    new_ids.push_back(id);
-                }
-
-                Statement update_revision(db,
-                        "UPDATE premise_config SET content_revision = content_revision + 1 WHERE id = 1");
-                update_revision.run();
-                if (sqlite3_changes(db) != 1) {
-                    throw std::runtime_error("premise database has no configuration row");
-                }
-                exec(db, "COMMIT");
-                break;
-            } catch (...) {
-                rollback(db);
-                try {
-                    refresh_database_locked(true);
-                } catch (...) {
-                }
-                throw;
-            }
-        }
-
+        exec("BEGIN IMMEDIATE");
         try {
-            apply_committed_replacement_locked(module, version_token, accepted, new_ids);
+            statement remove(db, "DELETE FROM premise_modules WHERE module = ?1"); // cascades to declarations
+            remove.bind(1, module);
+            remove.run();
+            statement insert_module(db, "INSERT INTO premise_modules(module, version_token) VALUES(?1, ?2)");
+            insert_module.bind(1, module);
+            insert_module.bind(2, token);
+            insert_module.run();
+            statement insert_decl(db, "INSERT INTO premise_declarations(module, ordinal, name) VALUES(?1, ?2, ?3)");
+            statement insert_embedding(db,
+                    "INSERT INTO premise_declaration_embeddings(declaration_id, embedding) VALUES(?1, ?2)");
+            std::vector<ggml_fp16_t> half(dim);
+            for (size_t i = 0; i < entry.names.size(); ++i) {
+                insert_decl.bind(1, module);
+                insert_decl.bind(2, (int64_t) i);
+                insert_decl.bind(3, entry.names[i]);
+                insert_decl.run();
+                ggml_fp32_to_fp16_row(entry.embeddings.data() + i * dim, half.data(), dim);
+                insert_embedding.bind(1, (int64_t) sqlite3_last_insert_rowid(db));
+                insert_embedding.bind_blob(2, half.data(), (int) (half.size() * sizeof(ggml_fp16_t)));
+                insert_embedding.run();
+            }
+            exec("COMMIT");
         } catch (...) {
-            refresh_database_locked(true);
+            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
+            throw;
         }
+        modules[module] = std::move(entry);
     }
 
-    std::vector<Hit> search_global(const float * query, int top_k) const {
-        std::lock_guard<std::mutex> lock(mu);
-        require_db();
-        refresh_database_locked();
-        if (top_k <= 0) {
+    // the k best-scoring declarations among `modules` and `locals`, one per name
+    std::vector<hit> search(const std::vector<float> & query, const std::vector<std::string> & selected,
+                            const std::vector<decl> & locals, int k) const {
+        validate(query, "query embedding");
+        if (k <= 0) {
             return {};
         }
-        validate_vector(query, dim, "query embedding");
-
-        std::vector<Hit> hits = search_base(query, top_k, nullptr);
-        trim_hits(hits, top_k);
-        return hits;
-    }
-
-    std::vector<Hit> search_scoped(const float * query,
-                                   const std::vector<std::string> & selected_modules,
-                                   const std::vector<Candidate> & locals,
-                                   int top_k) const {
-        std::lock_guard<std::mutex> lock(mu);
-        require_db();
-        refresh_database_locked();
-        if (top_k <= 0) {
-            return {};
-        }
-        validate_vector(query, dim, "query embedding");
-
-        if (scope_cache.revision != content_revision || scope_cache.modules != selected_modules) {
-            scope_cache = {};
-            scope_cache.revision = content_revision;
-            scope_cache.modules = selected_modules;
-            for (const auto & module : selected_modules) {
-                collect_module_rows(module, scope_cache.names, scope_cache.ids);
+        // keep 2k so that dropping repeated names (a lemma cached by several modules) still leaves k
+        using scored = std::pair<float, const std::string *>;
+        std::priority_queue<scored, std::vector<scored>, std::greater<scored>> best;
+        auto offer = [&](float score, const std::string & name) {
+            if ((int) best.size() < 2 * k) {
+                best.emplace(score, &name);
+            } else if (score > best.top().first) {
+                best.pop();
+                best.emplace(score, &name);
+            }
+        };
+        for (const auto & module : selected) {
+            auto it = modules.find(module);
+            if (it == modules.end()) {
+                continue;
+            }
+            const module_entry & entry = it->second;
+            for (size_t i = 0; i < entry.names.size(); ++i) {
+                offer(dot(query.data(), entry.embeddings.data() + i * dim), entry.names[i]);
             }
         }
+        for (const auto & local : locals) {
+            validate(local.embedding, "local embedding");
+            offer(dot(query.data(), local.embedding.data()), local.name);
+        }
 
-        std::vector<Hit> hits = search_base(query, top_k, &scope_cache.ids);
-        score_locals(query, locals, &scope_cache.names, hits);
-        trim_hits(hits, top_k);
+        std::vector<scored> ranked;
+        for (; !best.empty(); best.pop()) {
+            ranked.push_back(best.top());
+        }
+        std::sort(ranked.begin(), ranked.end(), [](const scored & a, const scored & b) {
+            return a.first != b.first ? a.first > b.first : *a.second < *b.second;
+        });
+        std::vector<hit> hits;
+        std::unordered_set<std::string> seen;
+        for (const auto & [score, name] : ranked) {
+            if ((int) hits.size() < k && seen.insert(*name).second) {
+                hits.push_back({*name, score});
+            }
+        }
         return hits;
     }
 
 private:
-    using LocalCache = std::list<std::pair<std::string, std::vector<float>>>;
-    static constexpr size_t LOCAL_CACHE_CAPACITY = 4096;
-
-    struct Row {
-        std::string name;
-        std::string module;
+    struct module_entry {
+        std::string token;
+        std::vector<std::string> names;
+        std::vector<float> embeddings; // one row of `dim` per name
     };
 
-    struct DatabaseState {
-        std::unordered_map<faiss::idx_t, Row> rows;
-        std::unordered_map<std::string, ModuleEntry> modules;
-        int64_t revision = 0;
-    };
-
-    struct BuiltIndex {
-        std::unique_ptr<faiss::IndexIDMap2> index;
-        std::unordered_set<faiss::idx_t> ids;
-    };
-
-    struct ScopeCache {
-        int64_t revision = -1;
-        std::vector<std::string> modules;
-        std::vector<faiss::idx_t> ids;
-        std::unordered_set<std::string> names;
-    };
-
-    struct Statement {
-        sqlite3 * db = nullptr;
+    struct statement {
+        sqlite3 * db;
         sqlite3_stmt * stmt = nullptr;
 
-        Statement(sqlite3 * database, const char * sql) : db(database) {
-            const int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr);
-            if (rc != SQLITE_OK) {
-                throw std::runtime_error(std::string("SQLite prepare failed: ") + sqlite3_errmsg(db));
-            }
+        statement(sqlite3 * db, const char * sql) : db(db) {
+            check(sqlite3_prepare_v2(db, sql, -1, &stmt, nullptr));
         }
-
-        ~Statement() {
+        ~statement() {
             sqlite3_finalize(stmt);
         }
 
-        void bind_int(int index, int value) {
-            check(sqlite3_bind_int(stmt, index, value));
+        void bind(int i, const std::string & text) {
+            check(sqlite3_bind_text(stmt, i, text.data(), (int) text.size(), SQLITE_TRANSIENT));
+        }
+        void bind(int i, int64_t value) {
+            check(sqlite3_bind_int64(stmt, i, value));
+        }
+        void bind_blob(int i, const void * data, int bytes) {
+            check(sqlite3_bind_blob(stmt, i, data, bytes, SQLITE_TRANSIENT));
         }
 
-        void bind_int64(int index, int64_t value) {
-            check(sqlite3_bind_int64(stmt, index, value));
-        }
-
-        void bind_text(int index, const std::string & value) {
-            if (value.size() > (size_t) std::numeric_limits<int>::max()) {
-                throw std::runtime_error("text value is too large for SQLite");
-            }
-            check(sqlite3_bind_text(stmt, index, value.data(), (int) value.size(), SQLITE_TRANSIENT));
-        }
-
-        void bind_vector(int index, const std::vector<float> & value) {
-            std::vector<uint16_t> half(value.size());
-            std::transform(value.begin(), value.end(), half.begin(),
-                    [](float x) { return faiss::encode_fp16(x); });
-            const size_t bytes = half.size() * sizeof(uint16_t);
-            if (bytes > (size_t) std::numeric_limits<int>::max()) {
-                throw std::runtime_error("embedding is too large for SQLite");
-            }
-            check(sqlite3_bind_blob(stmt, index, half.data(), (int) bytes, SQLITE_TRANSIENT));
-        }
-
+        // true while there is a row to read
         bool step() {
             const int rc = sqlite3_step(stmt);
-            if (rc == SQLITE_ROW) {
-                return true;
+            if (rc != SQLITE_ROW && rc != SQLITE_DONE) {
+                check(rc);
             }
-            if (rc != SQLITE_DONE) {
-                throw std::runtime_error(std::string("SQLite step failed: ") + sqlite3_errmsg(db));
-            }
-            return false;
+            return rc == SQLITE_ROW;
         }
-
+        // execute a statement that returns no rows, ready to be bound again
         void run() {
-            if (step()) {
-                throw std::runtime_error("SQLite statement unexpectedly returned a row");
-            }
-        }
-
-        void reset() {
+            step();
             check(sqlite3_reset(stmt));
-            check(sqlite3_clear_bindings(stmt));
         }
 
-    private:
-        void check(int rc) {
+        std::string text(int column) const {
+            const char * data = reinterpret_cast<const char *>(sqlite3_column_text(stmt, column));
+            return data ? std::string(data, (size_t) sqlite3_column_bytes(stmt, column)) : std::string();
+        }
+
+        void check(int rc) const {
             if (rc != SQLITE_OK) {
-                throw std::runtime_error(std::string("SQLite operation failed: ") + sqlite3_errmsg(db));
+                throw std::runtime_error(std::string("SQLite: ") + sqlite3_errmsg(db));
             }
         }
     };
 
     sqlite3 * db = nullptr;
-    int dim = 0;
-    mutable int observed_data_version = -1;
-    mutable int64_t content_revision = 0;
-    mutable std::unordered_map<faiss::idx_t, Row> rows;
-    mutable std::unordered_map<std::string, ModuleEntry> modules;
-    mutable std::unique_ptr<faiss::IndexIDMap2> base_index;
-    mutable std::unordered_set<faiss::idx_t> base_ids;
-    mutable ScopeCache scope_cache;
-    std::mutex local_cache_mu;
-    LocalCache local_cache;
-    std::unordered_map<std::string, LocalCache::iterator> local_cache_index;
-    mutable std::mutex mu;
+    int dim;
+    std::unordered_map<std::string, module_entry> modules;
 
-    void require_db() const {
-        if (!db) {
-            throw std::runtime_error("premise database is not open");
-        }
-    }
-
-    static void exec(sqlite3 * database, const char * sql) {
+    void exec(const char * sql) {
         char * error = nullptr;
-        const int rc = sqlite3_exec(database, sql, nullptr, nullptr, &error);
-        if (rc != SQLITE_OK) {
-            const std::string message = error ? error : sqlite3_errmsg(database);
+        if (sqlite3_exec(db, sql, nullptr, nullptr, &error) != SQLITE_OK) {
+            const std::string message = error ? error : sqlite3_errmsg(db);
             sqlite3_free(error);
-            throw std::runtime_error("SQLite execution failed: " + message);
+            throw std::runtime_error("SQLite: " + message);
         }
     }
 
-    static void rollback(sqlite3 * database) noexcept {
-        sqlite3_exec(database, "ROLLBACK", nullptr, nullptr, nullptr);
-    }
-
-    static int64_t checked_int64(size_t value, const char * message) {
-        if (value > (size_t) std::numeric_limits<int64_t>::max()) {
-            throw std::runtime_error(message);
-        }
-        return (int64_t) value;
-    }
-
-    static std::string column_text(sqlite3_stmt * statement, int column) {
-        const char * data = reinterpret_cast<const char *>(sqlite3_column_text(statement, column));
-        const int bytes = sqlite3_column_bytes(statement, column);
-        return data ? std::string(data, (size_t) bytes) : std::string();
-    }
-
-    static void validate_vector(const float * values, int dimensions, const char * what) {
-        if (!values || dimensions <= 0) {
-            throw std::runtime_error(std::string(what) + " is empty");
-        }
-        double norm_squared = 0.0;
-        for (int i = 0; i < dimensions; ++i) {
-            if (!std::isfinite(values[i])) {
-                throw std::runtime_error(std::string(what) + " contains a non-finite component");
-            }
-            norm_squared += (double) values[i] * values[i];
-        }
-        if (!std::isfinite(norm_squared) || std::fabs(norm_squared - 1.0) > 1e-3) {
-            throw std::runtime_error(std::string(what) + " is not approximately unit normalized");
-        }
-    }
-
-    static void validate_vector(const std::vector<float> & values, int dimensions, const char * what) {
-        if ((int) values.size() != dimensions) {
-            throw std::runtime_error(std::string(what) + " dimension mismatch");
-        }
-        validate_vector(values.data(), dimensions, what);
-    }
-
-    static bool table_exists(sqlite3 * database, const char * name) {
-        Statement statement(database,
-                "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1");
-        statement.bind_text(1, name);
-        return statement.step();
-    }
-
-    static int64_t read_content_revision(sqlite3 * database) {
-        Statement statement(database,
-                "SELECT content_revision FROM premise_config WHERE id = 1");
-        if (!statement.step()) {
-            throw std::runtime_error("premise database has no configuration row");
-        }
-        if (sqlite3_column_type(statement.stmt, 0) != SQLITE_INTEGER) {
-            throw std::runtime_error("invalid premise database content revision");
-        }
-        const int64_t revision = sqlite3_column_int64(statement.stmt, 0);
-        if (revision < 0 || statement.step()) {
-            throw std::runtime_error("invalid premise database content revision");
-        }
-        return revision;
-    }
-
-    int data_version_locked() const {
-        Statement statement(db, "PRAGMA data_version");
-        if (!statement.step()) {
-            throw std::runtime_error("SQLite did not return a data version");
-        }
-        return sqlite3_column_int(statement.stmt, 0);
-    }
-
-    void initialize_schema_locked() {
-        exec(db, "BEGIN IMMEDIATE");
+    void init_schema() {
+        exec("BEGIN IMMEDIATE");
         try {
-            if (table_exists(db, "premise_config")) {
-                Statement read_config(db,
-                        "SELECT schema_version, embedding_dim "
-                        "FROM premise_config WHERE id = 1");
-                if (!read_config.step()) {
-                    throw std::runtime_error("premise database has no configuration row");
-                }
-                const int stored_schema = sqlite3_column_int(read_config.stmt, 0);
-                const int stored_dim = sqlite3_column_int(read_config.stmt, 1);
-                if (read_config.step()) {
-                    throw std::runtime_error("premise database has multiple configuration rows");
-                }
-                if (stored_schema != premise_schema::VERSION) {
+            statement exists(db, "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'premise_config'");
+            if (exists.step()) {
+                statement config(db, "SELECT schema_version, embedding_dim FROM premise_config WHERE id = 1");
+                if (!config.step() || sqlite3_column_int(config.stmt, 0) != premise_schema::VERSION) {
                     throw std::runtime_error("unsupported premise database schema version");
                 }
-                if (stored_dim != dim) {
-                    throw std::runtime_error("premise database embedding dimension does not match model");
+                if (sqlite3_column_int(config.stmt, 1) != dim) {
+                    throw std::runtime_error("premise database embedding dimension does not match the model");
                 }
-                exec(db, premise_schema::SQL);
             } else {
-                exec(db, premise_schema::SQL);
-                Statement insert_config(db,
-                        "INSERT INTO premise_config("
-                        "id, schema_version, embedding_dim, content_revision) "
-                        "VALUES(1, ?1, ?2, 0)");
-                insert_config.bind_int(1, premise_schema::VERSION);
-                insert_config.bind_int(2, dim);
-                insert_config.run();
+                exec(premise_schema::SQL);
+                statement config(db, "INSERT INTO premise_config(id, schema_version, embedding_dim) VALUES(1, ?1, ?2)");
+                config.bind(1, (int64_t) premise_schema::VERSION);
+                config.bind(2, (int64_t) dim);
+                config.run();
             }
-            Statement declaration_schema(db,
-                    "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'premise_declarations'");
-            if (!declaration_schema.step() ||
-                    sqlite3_column_type(declaration_schema.stmt, 0) != SQLITE_TEXT) {
-                throw std::runtime_error("premise declaration schema is missing");
-            }
-            std::string declaration_sql = column_text(declaration_schema.stmt, 0);
-            std::transform(declaration_sql.begin(), declaration_sql.end(), declaration_sql.begin(),
-                    [](unsigned char c) { return (char) std::toupper(c); });
-            if (declaration_sql.find("AUTOINCREMENT") == std::string::npos || declaration_schema.step()) {
-                throw std::runtime_error("premise declaration IDs must not be reused");
-            }
-            exec(db, "COMMIT");
+            exec("COMMIT");
         } catch (...) {
-            rollback(db);
+            sqlite3_exec(db, "ROLLBACK", nullptr, nullptr, nullptr);
             throw;
         }
     }
 
-    static DatabaseState read_database_state(sqlite3 * database, int dimensions) {
-        DatabaseState state;
-        {
-            Statement config(database,
-                    "SELECT schema_version, embedding_dim, content_revision "
-                    "FROM premise_config WHERE id = 1");
-            if (!config.step() ||
-                    sqlite3_column_type(config.stmt, 0) != SQLITE_INTEGER ||
-                    sqlite3_column_type(config.stmt, 1) != SQLITE_INTEGER ||
-                    sqlite3_column_type(config.stmt, 2) != SQLITE_INTEGER ||
-                    sqlite3_column_int(config.stmt, 0) != premise_schema::VERSION ||
-                    sqlite3_column_int(config.stmt, 1) != dimensions) {
-                throw std::runtime_error("invalid premise database configuration");
+    void load() {
+        statement tokens(db, "SELECT module, version_token FROM premise_modules");
+        while (tokens.step()) {
+            modules[tokens.text(0)].token = tokens.text(1);
+        }
+        statement rows(db,
+                "SELECT d.module, d.name, e.embedding FROM premise_declarations d "
+                "JOIN premise_declaration_embeddings e ON e.declaration_id = d.id ORDER BY d.module, d.ordinal");
+        std::vector<ggml_fp16_t> half(dim);
+        std::vector<float> row(dim);
+        while (rows.step()) {
+            if (sqlite3_column_bytes(rows.stmt, 2) != dim * (int) sizeof(ggml_fp16_t)) {
+                throw std::runtime_error("stored embedding dimension mismatch");
             }
-            state.revision = sqlite3_column_int64(config.stmt, 2);
-            if (state.revision < 0 || config.step()) {
-                throw std::runtime_error("invalid premise database configuration");
-            }
-        }
-
-        Statement read_modules(database,
-                "SELECT module, version_token FROM premise_modules ORDER BY module");
-        while (read_modules.step()) {
-            const std::string module = column_text(read_modules.stmt, 0);
-            const std::string token = column_text(read_modules.stmt, 1);
-            if (!state.modules.emplace(module, ModuleEntry{token, {}}).second) {
-                throw std::runtime_error("duplicate module metadata in premise database");
-            }
-        }
-
-        Statement read_declarations(database,
-                "SELECT id, module, name FROM premise_declarations ORDER BY module, ordinal");
-        while (read_declarations.step()) {
-            const faiss::idx_t id = sqlite3_column_int64(read_declarations.stmt, 0);
-            const std::string module = column_text(read_declarations.stmt, 1);
-            const std::string name = column_text(read_declarations.stmt, 2);
-            auto module_it = state.modules.find(module);
-            if (id <= 0 || name.empty() || module_it == state.modules.end()) {
-                throw std::runtime_error("invalid declaration metadata in premise database");
-            }
-            if (!state.rows.emplace(id, Row{name, module}).second) {
-                throw std::runtime_error("duplicate declaration ID in premise database");
-            }
-            module_it->second.declaration_ids.push_back(id);
-        }
-        return state;
-    }
-
-    static std::unique_ptr<faiss::IndexIDMap2> make_index(int dimensions) {
-        auto result = std::make_unique<faiss::IndexIDMap2>(new faiss::IndexScalarQuantizer(
-                dimensions, faiss::ScalarQuantizer::QT_fp16, faiss::METRIC_INNER_PRODUCT));
-        result->own_fields = true;
-        return result;
-    }
-
-    static void decode_stored_vector(const void * blob, int bytes, int dimensions, float * out) {
-        if (!blob || bytes != dimensions * (int) sizeof(uint16_t)) {
-            throw std::runtime_error("stored embedding dimension mismatch");
-        }
-        const uint8_t * data = static_cast<const uint8_t *>(blob);
-        for (int i = 0; i < dimensions; ++i) {
-            uint16_t half;
-            std::memcpy(&half, data + (size_t) i * sizeof(half), sizeof(half));
-            out[i] = faiss::decode_fp16(half);
-        }
-        validate_vector(out, dimensions, "stored embedding");
-    }
-
-    static BuiltIndex build_index(
-            sqlite3 * database, const DatabaseState & state, int dimensions) {
-        BuiltIndex built;
-        built.index = make_index(dimensions);
-        built.ids.reserve(state.rows.size());
-
-        constexpr size_t batch_size = 1024;
-        std::vector<faiss::idx_t> ids;
-        std::vector<float> embeddings;
-        ids.reserve(std::min(batch_size, state.rows.size()));
-        if ((size_t) dimensions > std::numeric_limits<size_t>::max() / batch_size) {
-            throw std::runtime_error("premise embedding dimension is too large");
-        }
-        embeddings.reserve(std::min(batch_size, state.rows.size()) * (size_t) dimensions);
-
-        Statement read_embeddings(database,
-                "SELECT declaration_id, embedding "
-                "FROM premise_declaration_embeddings ORDER BY declaration_id");
-        while (read_embeddings.step()) {
-            const faiss::idx_t id = sqlite3_column_int64(read_embeddings.stmt, 0);
-            const int bytes = sqlite3_column_bytes(read_embeddings.stmt, 1);
-            const void * blob = sqlite3_column_blob(read_embeddings.stmt, 1);
-            if (state.rows.find(id) == state.rows.end() || !built.ids.insert(id).second) {
-                throw std::runtime_error("invalid declaration embedding ID");
-            }
-            ids.push_back(id);
-            const size_t offset = embeddings.size();
-            embeddings.resize(offset + (size_t) dimensions);
-            decode_stored_vector(blob, bytes, dimensions, embeddings.data() + offset);
-            if (ids.size() == batch_size) {
-                built.index->add_with_ids((faiss::idx_t) ids.size(), embeddings.data(), ids.data());
-                ids.clear();
-                embeddings.clear();
-            }
-        }
-        if (!ids.empty()) {
-            built.index->add_with_ids((faiss::idx_t) ids.size(), embeddings.data(), ids.data());
-        }
-        if (built.ids.size() != state.rows.size()) {
-            throw std::runtime_error("premise embedding/declaration row count mismatch");
-        }
-        return built;
-    }
-
-    void refresh_database_locked(bool force = false) const {
-        int before = data_version_locked();
-        if (!force && before == observed_data_version) {
-            return;
-        }
-
-        for (;;) {
-            DatabaseState state;
-            BuiltIndex built;
-            exec(db, "BEGIN");
-            try {
-                state = read_database_state(db, dim);
-                built = build_index(db, state, dim);
-                exec(db, "COMMIT");
-            } catch (...) {
-                rollback(db);
-                throw;
-            }
-            const int after = data_version_locked();
-            if (before != after) {
-                before = after;
-                continue;
-            }
-
-            rows = std::move(state.rows);
-            modules = std::move(state.modules);
-            content_revision = state.revision;
-            observed_data_version = after;
-            base_index = std::move(built.index);
-            base_ids = std::move(built.ids);
-            scope_cache = {};
-            return;
+            std::memcpy(half.data(), sqlite3_column_blob(rows.stmt, 2), half.size() * sizeof(ggml_fp16_t));
+            ggml_fp16_to_fp32_row(half.data(), row.data(), dim);
+            validate(row, "stored embedding");
+            module_entry & entry = modules[rows.text(0)];
+            entry.names.push_back(rows.text(1));
+            entry.embeddings.insert(entry.embeddings.end(), row.begin(), row.end());
         }
     }
 
-    void apply_committed_replacement_locked(
-            const std::string & module,
-            const std::string & version_token,
-            const std::vector<const Candidate *> & accepted,
-            const std::vector<faiss::idx_t> & new_ids) {
-        std::vector<faiss::idx_t> old_ids;
-        auto existing = modules.find(module);
-        if (existing != modules.end()) {
-            old_ids = existing->second.declaration_ids;
+    void validate(const std::vector<float> & v, const char * what) const {
+        if ((int) v.size() != dim) {
+            throw std::runtime_error(std::string(what) + " has the wrong dimension");
         }
-
-        std::vector<faiss::idx_t> old_base_ids;
-        old_base_ids.reserve(old_ids.size());
-        for (faiss::idx_t id : old_ids) {
-            if (base_ids.find(id) != base_ids.end()) {
-                old_base_ids.push_back(id);
-            }
+        double norm_squared = 0.0;
+        for (float x : v) {
+            norm_squared += (double) x * x;
         }
-        if (!old_base_ids.empty()) {
-            faiss::IDSelectorBatch remove(old_base_ids.size(), old_base_ids.data());
-            if (base_index->remove_ids(remove) != old_base_ids.size()) {
-                throw std::runtime_error("failed to remove stale declaration IDs from FAISS");
-            }
-        }
-
-        for (faiss::idx_t id : old_ids) {
-            rows.erase(id);
-            base_ids.erase(id);
-        }
-
-        ModuleEntry & entry = modules[module];
-        entry.version_token = version_token;
-        entry.declaration_ids = new_ids;
-        if (!new_ids.empty()) {
-            std::vector<float> embeddings;
-            embeddings.reserve(new_ids.size() * (size_t) dim);
-            for (const Candidate * candidate : accepted) {
-                embeddings.insert(embeddings.end(),
-                        candidate->embedding.begin(), candidate->embedding.end());
-            }
-            base_index->add_with_ids(
-                    (faiss::idx_t) new_ids.size(), embeddings.data(), new_ids.data());
-            base_ids.insert(new_ids.begin(), new_ids.end());
-        }
-        for (size_t i = 0; i < new_ids.size(); ++i) {
-            const faiss::idx_t id = new_ids[i];
-            rows.emplace(id, Row{accepted[i]->name, module});
-        }
-        ++content_revision;
-        scope_cache = {};
-    }
-
-    std::vector<Hit> search_base(
-            const float * query,
-            int top_k,
-            const std::vector<faiss::idx_t> * eligible_ids) const {
-        if (!base_index || base_ids.empty() || top_k <= 0) {
-            return {};
-        }
-
-        size_t available = base_ids.size();
-        if (eligible_ids) {
-            available = 0;
-            for (faiss::idx_t id : *eligible_ids) {
-                available += base_ids.find(id) != base_ids.end();
-            }
-        }
-        const faiss::idx_t count = (faiss::idx_t) std::min<size_t>((size_t) top_k, available);
-        if (count <= 0) {
-            return {};
-        }
-
-        std::vector<float> scores((size_t) count);
-        std::vector<faiss::idx_t> labels((size_t) count);
-        if (eligible_ids) {
-            faiss::IDSelectorBatch allow(eligible_ids->size(), eligible_ids->data());
-            faiss::SearchParameters parameters;
-            parameters.sel = &allow;
-            base_index->search(1, query, count, scores.data(), labels.data(), &parameters);
-        } else {
-            base_index->search(1, query, count, scores.data(), labels.data());
-        }
-
-        std::vector<Hit> hits;
-        hits.reserve((size_t) count);
-        for (faiss::idx_t i = 0; i < count; ++i) {
-            const faiss::idx_t id = labels[(size_t) i];
-            auto row = rows.find(id);
-            if (base_ids.find(id) != base_ids.end() && row != rows.end()) {
-                hits.push_back({row->second.name, row->second.module, scores[(size_t) i]});
-            }
-        }
-        return hits;
-    }
-
-    void score_locals(
-            const float * query,
-            const std::vector<Candidate> & locals,
-            const std::unordered_set<std::string> * indexed_names,
-            std::vector<Hit> & hits) const {
-        std::unordered_set<std::string> local_names;
-        for (const auto & local : locals) {
-            if (local.name.empty() ||
-                    (indexed_names && indexed_names->find(local.name) != indexed_names->end()) ||
-                    !local_names.insert(local.name).second) {
-                continue;
-            }
-            validate_vector(local.embedding, dim, "local embedding");
-            float score = 0.0f;
-            for (int i = 0; i < dim; ++i) {
-                score += query[i] * local.embedding[(size_t) i];
-            }
-            hits.push_back({local.name, local.module, score});
+        if (!std::isfinite(norm_squared) || std::fabs(norm_squared - 1.0) > 1e-3) {
+            throw std::runtime_error(std::string(what) + " is not unit length");
         }
     }
 
-    static void trim_hits(std::vector<Hit> & hits, int top_k) {
-        const size_t count = std::min((size_t) top_k, hits.size());
-        if (count < hits.size()) {
-            std::partial_sort(hits.begin(), hits.begin() + count, hits.end(),
-                    [](const Hit & a, const Hit & b) { return a.score > b.score; });
-            hits.resize(count);
-        } else {
-            std::sort(hits.begin(), hits.end(),
-                    [](const Hit & a, const Hit & b) { return a.score > b.score; });
-        }
-    }
-
-    void collect_module_rows(
-            const std::string & module,
-            std::unordered_set<std::string> & taken_names,
-            std::vector<faiss::idx_t> & candidate_rows) const {
-        auto it = modules.find(module);
-        if (it == modules.end()) {
-            return;
-        }
-        for (faiss::idx_t id : it->second.declaration_ids) {
-            auto row = rows.find(id);
-            if (row != rows.end() && !row->second.name.empty() &&
-                    taken_names.insert(row->second.name).second) {
-                candidate_rows.push_back(id);
+    // independent partial sums let compilers vectorize without reassociating
+    float dot(const float * a, const float * b) const {
+        float partial[8] = {};
+        int i = 0;
+        for (; i + 8 <= dim; i += 8) {
+            for (int j = 0; j < 8; ++j) {
+                partial[j] += a[i + j] * b[i + j];
             }
         }
+        float sum = 0.0f;
+        for (; i < dim; ++i) {
+            sum += a[i] * b[i];
+        }
+        for (float p : partial) {
+            sum += p;
+        }
+        return sum;
     }
 };

@@ -48,53 +48,6 @@ if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} LIBRARY)
 endif()
 
-# Optional premise retrieval mode (--premise), built into llama-server
-if (PremiseServer)
-    set(_ROOT_DIR "${CMAKE_SOURCE_DIR}")
-
-    add_library(llama-server-premise STATIC
-        premise/premise.cpp
-    )
-    target_include_directories(llama-server-premise PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/premise
-        ${CMAKE_CURRENT_SOURCE_DIR}
-        ${_ROOT_DIR}
-        ${_ROOT_DIR}/include
-        ${_ROOT_DIR}/common
-        ${_ROOT_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/../mtmd
-        ${_ROOT_DIR}/vendor
-        ${_ROOT_DIR}/vendor/nlohmann
-    )
-    target_link_libraries(llama-server-premise PUBLIC llama llama-common)
-    target_compile_features(llama-server-premise PUBLIC cxx_std_17)
-
-    add_subdirectory(${_ROOT_DIR}/vendor/sqlite ${CMAKE_BINARY_DIR}/vendor/sqlite)
-
-    if (NOT TARGET faiss AND NOT TARGET faiss::faiss)
-        find_package(faiss CONFIG QUIET)
-    endif()
-    if (NOT TARGET faiss AND NOT TARGET faiss::faiss)
-        add_subdirectory(${_ROOT_DIR}/vendor/faiss ${CMAKE_BINARY_DIR}/vendor/faiss)
-    endif()
-    if (TARGET faiss)
-        set(_premise_faiss_target faiss)
-    elseif (TARGET faiss::faiss)
-        set(_premise_faiss_target faiss::faiss)
-    else()
-        message(FATAL_ERROR "FAISS was found, but no known CMake target was exported")
-    endif()
-    target_link_libraries(llama-server-premise PUBLIC llama-sqlite3 ${_premise_faiss_target})
-
-    add_executable(test-premise-index EXCLUDE_FROM_ALL premise/test-index.cpp)
-    target_link_libraries(test-premise-index PRIVATE llama-sqlite3 ${_premise_faiss_target})
-    target_compile_features(test-premise-index PRIVATE cxx_std_17)
-    if (LLAMA_BUILD_TESTS)
-        add_test(NAME test-premise-index COMMAND test-premise-index)
-    endif()
-    message(STATUS "llama-server: premise mode enabled (use --premise)")
-endif()
-
 # llama-server executable
 
 set(TARGET llama-server)
@@ -105,7 +58,20 @@ install(TARGETS ${TARGET} RUNTIME)
 target_link_libraries(${TARGET} PRIVATE llama-server-impl)
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
-if (TARGET llama-server-premise)
+# premise retrieval mode (llama-server --premise), see premise/
+option(LLAMA_SERVER_PREMISE "llama-server: build premise retrieval mode (--premise)" OFF)
+if (LLAMA_SERVER_PREMISE)
+    add_subdirectory(${CMAKE_SOURCE_DIR}/vendor/sqlite ${CMAKE_BINARY_DIR}/vendor/sqlite)
+    target_sources(${TARGET} PRIVATE premise/premise.cpp)
     target_compile_definitions(${TARGET} PRIVATE LLAMA_PREMISE_SERVER)
-    target_link_libraries(${TARGET} PRIVATE llama-server-premise)
+    target_link_libraries(${TARGET} PRIVATE llama-sqlite3)
+
+    add_executable(test-premise-index premise/test-index.cpp)
+    target_link_libraries(test-premise-index PRIVATE llama-sqlite3 ggml)
+    target_compile_features(test-premise-index PRIVATE cxx_std_17)
+    if (LLAMA_BUILD_TESTS)
+        add_test(NAME test-premise-index COMMAND test-premise-index)
+    else()
+        set_target_properties(test-premise-index PROPERTIES EXCLUDE_FROM_ALL ON)
+    endif()
 endif()

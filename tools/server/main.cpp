@@ -3,7 +3,7 @@
 int llama_server(int argc, char ** argv);
 
 #if defined(LLAMA_PREMISE_SERVER)
-#include "premise.hpp"
+#include "premise/premise.hpp"
 
 static bool wants_premise_mode(int argc, char ** argv) {
     for (int i = 1; i < argc; ++i) {

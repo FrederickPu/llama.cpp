@@ -1,15 +1,11 @@
-"""
-Demo and regression test for llama-server --premise.
+#!/usr/bin/env python3
+"""End-to-end test of llama-server --premise over HTTP, as the Lean client uses it.
 
-Premise mode is embedding-only retrieval used by CanonicalDrafter to rank Lean
-premises. It does not generate text. The intended flow is:
+    python tools/server/premise/test_regression.py --model MODEL.gguf [--server-bin build/bin/llama-server]
 
-  1. Start: llama-server --premise --model ... --index-db ...
-  2. Ask /version which Lean modules are already cached.
-  3. Send that module's declarations to /cache when the version token is missing or stale.
-  4. Call /select with the flattened module list, local declarations, a goal, and k.
-
-Run with --print-guide to see the equivalent manual commands and JSON bodies.
+Starts the server on a fresh database, then checks /version, /cache, /select (with local
+declarations), packed batches, and swapping the database and model with PUT /config,
+including that rejected swaps leave the served pair unchanged. MODEL defaults to $PREMISE_MODEL.
 """
 
 from __future__ import annotations
@@ -18,597 +14,137 @@ import argparse
 import json
 import os
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
-import textwrap
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 
-if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8")
-if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8")
-
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
-LLAMA_DIR = REPO_ROOT
-BUILD_DIR = REPO_ROOT / "build"
-BUILD_BIN_DIR = BUILD_DIR / "bin"
+URL = ""
 
-CMAKE_CONFIGURE_ARGS = [
-    "-DLLAMA_BUILD_COMMON=ON",
-    "-DLLAMA_BUILD_EXAMPLES=OFF",
-    "-DLLAMA_BUILD_TOOLS=ON",
-    "-DLLAMA_BUILD_SERVER=ON",
-    "-DLLAMA_BUILD_TESTS=OFF",
-    "-DLLAMA_BUILD_LIBRESSL=ON",
-    "-DPremiseServer=ON",
-]
-
-DEFAULT_MODEL = Path("D:/hparam_outputs/thomas-zhu-lean-premise.f16.gguf")
-DEFAULT_INDEX_DB = BUILD_DIR / "premise-demo.db"
-THOMAS_ZHU_MODEL_ID = "l3lab/all-distilroberta-v1-lr2e-4-bs256-nneg3-ml-ne2"
-THOMAS_ZHU_MODEL_REVISION = "v4.30.0"
-
-BASE_URL = "http://127.0.0.1:8081"
-DEMO_MODULE = "Demo.Module"
-DEMO_TOKEN = "premise-server-demo-v1"
-DEMO_DECLARATIONS = [
+MODULE, TOKEN = "Demo.Module", "demo-v1"
+DECLARATIONS = [
     {"name": "Demo.zero_add", "decl": "theorem zero_add (n : Nat) : 0 + n = n"},
     {"name": "Demo.add_zero", "decl": "theorem add_zero (n : Nat) : n + 0 = n"},
 ]
-DEMO_GOAL = "|- n + 0 = n"
-TAIL_MODULE = "Demo.Tail"
-TAIL_TOKEN = "premise-server-tail-v1"
-TAIL_DECLARATION = {"name": "Demo.tail", "decl": "theorem tail : True"}
-REFRESH_TOKEN = "premise-server-demo-v2"
-REFRESH_DECLARATION = {"name": "Demo.replacement", "decl": "theorem replacement : True"}
-LOCAL_DECLARATION = {"name": "Demo.local", "decl": "theorem local (n : Nat) : n + 0 = n"}
-
-
-def die(message: str) -> None:
-    raise SystemExit(message)
-
-
-def find_exe(name: str, build_dir: Path = BUILD_DIR) -> Path | None:
-    pattern = f"**/{name}.exe" if os.name == "nt" else f"**/{name}"
-    matches = sorted(build_dir.glob(pattern))
-    return matches[0] if matches else None
-
-
-def configure_build() -> None:
-    if os.name == "nt":
-        vsdev = Path("C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/Common7/Tools/VsDevCmd.bat")
-        if vsdev.exists():
-            args = " ".join(CMAKE_CONFIGURE_ARGS)
-            command = f'call "{vsdev}" -arch=x64 && cmake -S "{LLAMA_DIR}" -B "{BUILD_DIR}" -G "NMake Makefiles" {args}'
-            subprocess.check_call(["cmd.exe", "/c", command], cwd=REPO_ROOT)
-            return
-    subprocess.check_call(["cmake", "-S", str(LLAMA_DIR), "-B", str(BUILD_DIR), *CMAKE_CONFIGURE_ARGS], cwd=REPO_ROOT)
-
-
-def build_target(target: str) -> None:
-    configure_build()
-    if os.name == "nt":
-        vsdev = Path("C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/Common7/Tools/VsDevCmd.bat")
-        if vsdev.exists():
-            command = f'call "{vsdev}" -arch=x64 && cmake --build "{BUILD_DIR}" --target {target}'
-            subprocess.check_call(["cmd.exe", "/c", command], cwd=REPO_ROOT)
-            return
-    subprocess.check_call(["cmake", "--build", str(BUILD_DIR), "--target", target], cwd=REPO_ROOT)
-
-
-def find_llama_server(server_bin: Path | None) -> Path:
-    if server_bin:
-        return server_bin
-    server = find_exe("llama-server")
-    if server:
-        return server
-
-    print("llama-server not found; building target llama-server...", flush=True)
-    build_target("llama-server")
-    server = find_exe("llama-server")
-    if not server:
-        die("Failed to locate llama-server after building it")
-    return server
-
-
-def premise_server_command(args: argparse.Namespace) -> list[str]:
-    command = [
-        str(find_llama_server(args.server_bin)),
-        "--premise",
-        "--host", args.host,
-        "--port", str(args.port),
-        "--model", str(args.model),
-        "--ctx-size", str(args.ctx_size),
-        "--index-db", str(args.index_db),
-    ]
-    command.extend(args.server_arg or [])
-    return command
-
-
-class ManagedPremiseServer:
-    def __init__(self, args: argparse.Namespace):
-        self.args = args
-        self.process: subprocess.Popen | None = None
-        self.log_file = None
-
-    def __enter__(self) -> "ManagedPremiseServer":
-        if not self.args.model.exists():
-            die(
-                f"Premise GGUF does not exist: {self.args.model}\n"
-                f"Expected Thomas Zhu model: {THOMAS_ZHU_MODEL_ID} revision {THOMAS_ZHU_MODEL_REVISION}"
-            )
-        self.args.index_db.parent.mkdir(parents=True, exist_ok=True)
-
-        env = os.environ.copy()
-        if BUILD_BIN_DIR.exists():
-            env["PATH"] = str(BUILD_BIN_DIR) + os.pathsep + env.get("PATH", "")
-
-        log_path = self.args.server_log or (BUILD_DIR / "premise-server-regression.log")
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        self.log_file = open(log_path, "w", encoding="utf-8")
-
-        command = premise_server_command(self.args)
-        print("Starting llama-server --premise:", " ".join(command), flush=True)
-
-        creationflags = 0
-        if os.name == "nt":
-            creationflags |= subprocess.CREATE_NEW_PROCESS_GROUP
-            creationflags |= subprocess.CREATE_NO_WINDOW
-
-        self.process = subprocess.Popen(
-            command,
-            cwd=REPO_ROOT,
-            env=env,
-            stdout=self.log_file,
-            stderr=self.log_file,
-            creationflags=creationflags,
-        )
-        self.wait_until_ready()
-        return self
-
-    def wait_until_ready(self) -> None:
-        deadline = time.time() + self.args.startup_timeout
-        health_url = f"http://{self.args.host}:{self.args.port}/health"
-
-        while time.time() < deadline:
-            if self.process and self.process.poll() is not None:
-                log_name = self.log_file.name
-                self.log_file.close()
-                self.log_file = None
-                die(f"llama-server exited early with code {self.process.returncode}; see {log_name}")
-            try:
-                with urllib.request.urlopen(health_url, timeout=2) as response:
-                    if response.status == 200:
-                        print(f"premise mode ready at {health_url}", flush=True)
-                        return
-            except Exception:
-                time.sleep(0.5)
-
-        die(f"Timed out waiting for llama-server --premise; see {self.log_file.name}")
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        if self.process and self.process.poll() is None:
-            print("Stopping llama-server", flush=True)
-            if os.name == "nt":
-                try:
-                    os.kill(self.process.pid, signal.CTRL_C_EVENT)
-                except OSError:
-                    self.process.terminate()
-            else:
-                self.process.terminate()
-            try:
-                self.process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=10)
-        if self.log_file:
-            self.log_file.close()
-
-
-def post_json(path: str, body: dict, timeout: int = 120, *, method: str = "POST"):
-    request = urllib.request.Request(
-        f"{BASE_URL}{path}",
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json"},
-        method=method,
-    )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
-def get_json(path: str, timeout: int = 120):
-    with urllib.request.urlopen(f"{BASE_URL}{path}", timeout=timeout) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
-def cache_ok(result) -> bool:
-    """/cache answers {"ok": true, ...} plus timing fields; only "ok" is contractual."""
-    return isinstance(result, dict) and result.get("ok") is True
-
-
-def cache_timing(result: dict) -> str:
-    return (
-        f"embed {result.get('embed_ms', 0.0):.1f} ms, "
-        f"replace_module {result.get('replace_ms', 0.0):.1f} ms"
-    )
-
-
-def cache_body() -> dict:
-    return {
-        "module": DEMO_MODULE,
-        "declarations": DEMO_DECLARATIONS,
-        "token": DEMO_TOKEN,
-    }
-
-
-def select_body(k: int = 2) -> dict:
-    return {
-        "modules": [DEMO_MODULE],
-        "declarations": [],
-        "goal": DEMO_GOAL,
-        "k": k,
-    }
-
-
-def dump_json(data: dict) -> str:
-    return json.dumps(data, indent=2, ensure_ascii=False)
-
-
-def run_tests(args: argparse.Namespace, alternate_database: str | None = None, model: Path | None = None) -> bool:
-    print(f"Using premise mode at {BASE_URL}", flush=True)
-
-    served = get_json("/config")
-    if (not isinstance(served, dict) or not isinstance(served.get("index"), str) or
-            not isinstance(served.get("model"), str)):
-        print(f"[FAIL] /config did not report the active database and model: {served!r}", file=sys.stderr)
-        return False
-    original_database = served["index"]
-    original_model = served["model"]
-
-    print(f"1. Checking /version for uncached module {DEMO_MODULE!r}", flush=True)
-    before_versions = post_json("/version", {"modules": [DEMO_MODULE]})
-    if not isinstance(before_versions, list) or len(before_versions) != 1:
-        print(f"[FAIL] expected one aligned version result, got {before_versions!r}", file=sys.stderr)
-        return False
-    before = before_versions[0]
-    if before is not None and not isinstance(before, str):
-        print(f"[FAIL] expected null or a version token string, got {before!r}", file=sys.stderr)
-        return False
-    if before is not None:
-        print(f"   module already has token {before!r}; refreshing it with {DEMO_TOKEN!r}", flush=True)
-
-    print(f"2. Sending {len(DEMO_DECLARATIONS)} declarations to /cache", flush=True)
-    cache_result = post_json("/cache", cache_body())
-    if not cache_ok(cache_result):
-        print(f"[FAIL] /cache returned {cache_result!r}", file=sys.stderr)
-        return False
-    print(f"   {cache_timing(cache_result)}", flush=True)
-
-    print("3. Verifying /version returns the cached token", flush=True)
-    after = post_json("/version", {"modules": [DEMO_MODULE]})
-    if after != [DEMO_TOKEN]:
-        print(f"[FAIL] expected aligned cached module token, got {after!r}", file=sys.stderr)
-        return False
-
-    print(f"4. Asking /select for premises relevant to goal {DEMO_GOAL!r}", flush=True)
-    suggestions = post_json("/select", select_body())
-    if len(suggestions) != 2 or not all("name" in item and "score" in item for item in suggestions):
-        print(f"[FAIL] /select returned malformed suggestions: {suggestions!r}", file=sys.stderr)
-        return False
-
-    print("5. Reusing an unchanged local declaration embedding", flush=True)
-    local_request = {
-        "modules": [DEMO_MODULE], "declarations": [LOCAL_DECLARATION], "goal": DEMO_GOAL, "k": 3,
-    }
-    local_first = post_json("/select", local_request)
-    local_cached = post_json("/select", local_request)
-    local_changed = len(local_cached) != len(local_first) or any(
-        before["name"] != after["name"] or abs(before["score"] - after["score"]) > 1e-6
-        for before, after in zip(local_first, local_cached)
-    )
-    if local_changed:
-        print(f"[FAIL] cached local selection changed: {local_first!r} != {local_cached!r}", file=sys.stderr)
-        return False
-
-    print("6. Appending a second module, then re-caching the first", flush=True)
-    if not cache_ok(post_json("/cache", {
-        "module": TAIL_MODULE,
-        "token": TAIL_TOKEN,
-        "declarations": [TAIL_DECLARATION],
-    })):
-        print("[FAIL] could not cache tail module", file=sys.stderr)
-        return False
-    if not cache_ok(post_json("/cache", {
-        "module": DEMO_MODULE,
-        "token": REFRESH_TOKEN,
-        "declarations": [REFRESH_DECLARATION],
-    })):
-        print("[FAIL] could not refresh first module", file=sys.stderr)
-        return False
-
-    refreshed = post_json("/select", {
-        "modules": [DEMO_MODULE], "declarations": [], "goal": "|- True", "k": 8,
-    })
-    tail = post_json("/select", {
-        "modules": [TAIL_MODULE], "declarations": [], "goal": "|- True", "k": 8,
-    })
-    if [item["name"] for item in refreshed] != [REFRESH_DECLARATION["name"]]:
-        print(f"[FAIL] refreshed module still has stale rows: {refreshed!r}", file=sys.stderr)
-        return False
-    if [item["name"] for item in tail] != [TAIL_DECLARATION["name"]]:
-        print(f"[FAIL] downstream labels shifted incorrectly: {tail!r}", file=sys.stderr)
-        return False
-    if post_json("/version", {"modules": [TAIL_MODULE]}) != [TAIL_TOKEN]:
-        print("[FAIL] tail module token changed during first-module refresh", file=sys.stderr)
-        return False
-
-    print("7. Checking pooled embeddings across a packed batch", flush=True)
-    batch_declarations = [
-        {"name": f"Demo.batch_{i}", "decl": DEMO_DECLARATIONS[0]["decl"]} for i in range(64)
-    ]
-    if not cache_ok(post_json("/cache", {
-        "module": DEMO_MODULE, "token": "premise-packed-batch-v1", "declarations": batch_declarations,
-    })):
-        print("[FAIL] could not cache packed declarations", file=sys.stderr)
-        return False
-    packed = post_json("/select", {
-        "goal": DEMO_DECLARATIONS[0]["decl"], "modules": [DEMO_MODULE], "k": len(batch_declarations),
-    })
-    if len(packed) != len(batch_declarations) or any(abs(hit["score"] - 1.0) > 1e-4 for hit in packed):
-        print("[FAIL] packed embeddings differ from the same text embedded alone", file=sys.stderr)
-        return False
-
-    if alternate_database is not None:
-        print("8. Switching databases, reselecting, and rejecting invalid paths", flush=True)
-        for path, token in [
-            (alternate_database, None),
-            (original_database, TAIL_TOKEN),
-            (original_database, TAIL_TOKEN),  # selecting the current path is a no-op
-        ]:
-            config = {"index": path, "model": original_model}
-            result = post_json("/config", config, method="PUT")
-            if result != {"ok": True} or get_json("/config") != config:
-                print(f"[FAIL] could not select premise database {path!r}: {result!r}", file=sys.stderr)
-                return False
-            if post_json("/version", {"modules": [TAIL_MODULE]}) != [token]:
-                print(f"[FAIL] selected database has incorrect cache: {path!r}", file=sys.stderr)
-                return False
-        original_config = {"index": original_database, "model": original_model}
-        missing_parent = str(Path(alternate_database).parent / "missing" / "premise.db")
-        invalid_configs = [
-            {"index": path, "model": original_model}
-            for path in ["", "\0", original_database + "\0suffix", missing_parent]
-        ]
-        invalid_configs += [{"index": original_database}, {"model": original_model}]
-        for config in invalid_configs:
-            try:
-                post_json("/config", config, method="PUT")
-            except urllib.error.HTTPError as error:
-                if error.code != 400 or "message" not in json.load(error).get("error", {}):
-                    raise
-            else:
-                print(f"[FAIL] accepted invalid config: {config!r}", file=sys.stderr)
-                return False
-            if (get_json("/config") != original_config or
-                    post_json("/version", {"modules": [TAIL_MODULE]}) != [TAIL_TOKEN]):
-                print("[FAIL] failed selection changed the active config", file=sys.stderr)
-                return False
-
-    if model is not None and alternate_database is not None:
-        print("9. Swapping the database and model together", flush=True)
-        original_config = {"index": original_database, "model": original_model}
-        swapped = model.with_name(model.name + ".swap.gguf")
-        shutil.copyfile(model, swapped)
-        try:
-            swapped_config = {"index": alternate_database, "model": str(swapped)}
-            if (post_json("/config", swapped_config, method="PUT") != {"ok": True} or
-                    get_json("/config") != swapped_config):
-                print("[FAIL] could not swap database and model", file=sys.stderr)
-                return False
-            if post_json("/version", {"modules": [TAIL_MODULE]}) != [None]:
-                print("[FAIL] swapped database has incorrect cache", file=sys.stderr)
-                return False
-            if not cache_ok(post_json("/cache", {
-                "module": TAIL_MODULE, "token": TAIL_TOKEN, "declarations": [TAIL_DECLARATION],
-            })):
-                print("[FAIL] could not cache with the swapped model", file=sys.stderr)
-                return False
-            try:
-                post_json("/config", {"index": original_database, "model": str(swapped) + ".missing"}, method="PUT")
-            except urllib.error.HTTPError as error:
-                if error.code != 400:
-                    raise
-            else:
-                print("[FAIL] accepted a missing model path", file=sys.stderr)
-                return False
-            if get_json("/config") != swapped_config:
-                print("[FAIL] failed model load changed the active config", file=sys.stderr)
-                return False
-            if (post_json("/config", original_config, method="PUT") != {"ok": True} or
-                    get_json("/config") != original_config):
-                print("[FAIL] could not swap back to the original database and model", file=sys.stderr)
-                return False
-            if post_json("/version", {"modules": [DEMO_MODULE]}) != ["premise-packed-batch-v1"]:
-                print("[FAIL] swapping the model changed the original database", file=sys.stderr)
-                return False
-        finally:
-            try:
-                swapped.unlink(missing_ok=True)
-            except OSError:
-                pass
-
-    print("premise mode demo OK. Suggestions:", flush=True)
-    print(json.dumps(suggestions, indent=2), flush=True)
-    return True
-
-
-def print_usage_guide(args: argparse.Namespace) -> None:
-    server_exe = args.server_bin or find_exe("llama-server") or (BUILD_BIN_DIR / ("llama-server.exe" if os.name == "nt" else "llama-server"))
-    version_request = dump_json({"modules": [DEMO_MODULE]})
-    cache_request = dump_json(cache_body())
-    select_request = dump_json(select_body())
-    line_continue = "^" if os.name == "nt" else "\\"
-    guide = f"""Manual equivalent of this regression runner
-==========================================
-
-Model
------
-
-This demo expects a GGUF embedding model compatible with Lean premise retrieval.
-The default is:
-
-  Hugging Face: {THOMAS_ZHU_MODEL_ID}
-  Revision:     {THOMAS_ZHU_MODEL_REVISION}
-  Local GGUF:   {args.model}
-
-Download or convert the model separately, then pass its GGUF path with --model.
-
-Build
------
-
-   cmake -S {LLAMA_DIR} -B {BUILD_DIR} {' '.join(CMAKE_CONFIGURE_ARGS)}
-   cmake --build {BUILD_DIR} --target llama-server
-
-Start
------
-
-The cache uses SQLite for module, declaration, and embedding data. FAISS is
-rebuilt in memory when a database is selected:
-  --index-db : optional initial SQLite premise database
-  PUT /config: select the active database and its model after startup
-Pretty-printed declaration strings are sent by Lean only to compute embeddings;
-they are not stored in the database.
-
-   {server_exe} --premise --host {args.host} --port {args.port} --model {args.model} {line_continue}
-       --ctx-size {args.ctx_size} {line_continue}
-       --index-db {args.index_db}
-
-API
----
-
-GET /config returns {{"index":".../premise.db","model":".../model.gguf"}}; "index"
-is null if no database is selected.
-PUT /config with JSON {{"index":"/absolute/path/to/premise.db",
-"model":"/absolute/path/to/model.gguf"}} selects a database together with the
-embedding model its vectors were computed with, and returns {{"ok":true}}. Both
-fields are required. The model is loaded and the database opened before either
-becomes active, so a failed request leaves the current pair in place; selecting
-the current pair is a no-op. The database is opened as-is and never reset, so
-give each model its own database.
-
-1. Check which module tokens are already cached in this process.
-
-   POST http://{args.host}:{args.port}/version
-   Content-Type: application/json
-
-{textwrap.indent(version_request, "   ")}
-
-   Expected before /cache: [null]
-
-2. Cache or refresh declarations for that one module (declarations are
-   batch-embedded in a single forward pass).
-
-   POST http://{args.host}:{args.port}/cache
-   Content-Type: application/json
-
-{textwrap.indent(cache_request, "   ")}
-
-   Expected response: {{"ok":true,"cached":false,"n_declarations":N,
-                       "embed_ms":...,"replace_ms":...}}
-   The *_ms fields report how long batch embedding took versus writing the
-   module into the index; "cached" is true when the token already matched and
-   no work was done.
-
-3. Confirm the module token now matches.
-
-   POST http://{args.host}:{args.port}/version
-   Content-Type: application/json
-
-{textwrap.indent(version_request, "   ")}
-
-   Expected after /cache: ["{DEMO_TOKEN}"]
-
-4. Select premises for a goal.
-
-   The modules list is the flattened import closure populated by /cache. The
-   declarations field is for local, one-off candidates that should be considered
-   for this request but not stored as a module cache entry.
-
-   POST http://{args.host}:{args.port}/select
-   Content-Type: application/json
-
-{textwrap.indent(select_request, "   ")}
-
-   Expected response shape:
-
-   [{{"name":"Demo.add_zero","score":0.87}}, ...]
-
-Notes
------
-
-  - Pooling defaults to the model metadata. Rebuild caches created without
-    special tokens before using the corrected embeddings.
-  - /version reads module freshness metadata from the active database and survives restart.
-  - /cache transactionally replaces the module metadata and embedding vectors.
-    Declaration strings are not persisted; FAISS remains in memory.
-  - Lean decides which declarations belong to each module and sends fully
-    qualified names through /cache; the server does not infer module membership.
-  - /version accepts multiple modules and returns aligned tokens; /cache remains one module per request.
-  - /select can include unsaved local declarations in the request body.
-  - --url runs the same demo against an existing premise-mode server and will
-    refresh {DEMO_MODULE} in that process.
-"""
-    print(guide.strip())
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Start llama-server --premise and demonstrate /version, /cache, and /select.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=textwrap.dedent("""
-        Common flows:
-          python tools/server/premise/test_regression.py --print-guide
-          python tools/server/premise/test_regression.py
-          python tools/server/premise/test_regression.py --url http://127.0.0.1:8081
-        """),
-    )
-    parser.add_argument("--print-guide", action="store_true", help="Print manual build/start/query commands and exit")
-    parser.add_argument("--url", help="Use an already-running premise-mode server; refreshes the demo module in that process")
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8081)
-    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL, help="GGUF embedding model")
-    parser.add_argument("--ctx-size", type=int, default=512)
-    parser.add_argument("--index-db", type=Path, default=DEFAULT_INDEX_DB, help="SQLite premise database")
-    parser.add_argument("--startup-timeout", type=int, default=180)
-    parser.add_argument("--server-bin", type=Path, help="Path to llama-server executable")
-    parser.add_argument("--server-log", type=Path)
-    parser.add_argument("--server-arg", action="append", help="Extra argument passed to llama-server; repeat as needed")
-    return parser.parse_args()
+GOAL = "|- n + 0 = n"
+TAIL = {"module": "Demo.Tail", "token": "tail-v1", "declarations": [{"name": "Demo.tail", "decl": "theorem tail : True"}]}
+LOCAL = {"name": "Demo.local", "decl": "theorem local (n : Nat) : n + 0 = n"}
+
+
+def request(path: str, body: dict, method: str = "POST"):
+    req = urllib.request.Request(URL + path, json.dumps(body).encode(), {"Content-Type": "application/json"}, method=method)
+    with urllib.request.urlopen(req, timeout=120) as res:
+        return json.load(res)
+
+
+def rejected(path: str, body: dict, method: str = "POST") -> bool:
+    try:
+        request(path, body, method)
+    except urllib.error.HTTPError as error:
+        return error.code == 400 and "message" in json.load(error).get("error", {})
+    return False
+
+
+def check(condition: bool, message: str) -> None:
+    if not condition:
+        raise AssertionError(message)
+
+
+def select(modules: list[str], goal: str, k: int, declarations: list | None = None) -> list[dict]:
+    return request("/select", {"modules": modules, "declarations": declarations or [], "goal": goal, "k": k})
+
+
+def run(index: Path, other: Path, model: Path) -> None:
+    check(request("/version", {"modules": [MODULE]}) == [None], "a new database caches nothing")
+
+    check(request("/cache", {"module": MODULE, "token": TOKEN, "declarations": DECLARATIONS}) == {"ok": True}, "/cache")
+    check(request("/version", {"modules": [MODULE, "Missing", MODULE]}) == [TOKEN, None, TOKEN],
+          "/version answers each requested module in order")
+    hits = select([MODULE], GOAL, 2)
+    check([h["name"] for h in hits] == ["Demo.add_zero", "Demo.zero_add"], f"/select ranks the goal's premise first: {hits}")
+
+    with_local = select([MODULE], GOAL, 3, [LOCAL])
+    check({h["name"] for h in with_local} == {"Demo.zero_add", "Demo.add_zero", "Demo.local"}, "local declarations are searched")
+    check(select([MODULE], GOAL, 3, [LOCAL]) == with_local, "repeating a request gives the same answer")
+
+    check(request("/cache", TAIL) == {"ok": True}, "caching a second module")
+    check(request("/cache", {"module": MODULE, "token": "demo-v2", "declarations": [{"name": "Demo.new", "decl": "theorem new : True"}]})
+          == {"ok": True}, "re-caching a module")
+    check([h["name"] for h in select([MODULE], "|- True", 8)] == ["Demo.new"], "re-caching replaces a module's declarations")
+    check([h["name"] for h in select(["Demo.Tail"], "|- True", 8)] == ["Demo.tail"], "re-caching leaves other modules")
+
+    packed = [{"name": f"Demo.batch_{i}", "decl": DECLARATIONS[0]["decl"]} for i in range(64)]
+    check(request("/cache", {"module": MODULE, "token": "packed-v1", "declarations": packed}) == {"ok": True}, "caching a packed batch")
+    hits = select([MODULE], DECLARATIONS[0]["decl"], 64)
+    check(len(hits) == 64 and all(abs(h["score"] - 1.0) < 1e-3 for h in hits),
+          "texts embedded in one packed batch match the same text embedded alone")
+
+    check(rejected("/cache", {"module": MODULE}), "/cache without a token is rejected")
+    check(rejected("/version", {"modules": [1]}), "/version with a non-string module is rejected")
+
+    served = {"index": str(index), "model": str(model)}
+    check(request("/config", {"index": str(other), "model": str(model)}, "PUT") == {"ok": True}, "switching databases")
+    check(request("/version", {"modules": ["Demo.Tail"]}) == [None], "the other database is served")
+    check(request("/config", served, "PUT") == {"ok": True}, "switching back")
+    check(request("/config", served, "PUT") == {"ok": True}, "selecting the served pair again")
+    check(request("/version", {"modules": ["Demo.Tail"]}) == ["tail-v1"], "the original database is served again")
+
+    for config in [{"index": "", "model": str(model)}, {"index": str(index) + "\0suffix", "model": str(model)},
+                   {"index": str(index.parent / "missing" / "premise.db"), "model": str(model)},
+                   {"index": str(index), "model": str(model) + ".missing"}, {"index": str(index)}]:
+        check(rejected("/config", config, "PUT"), f"invalid config is rejected: {config}")
+        check(request("/version", {"modules": ["Demo.Tail"]}) == ["tail-v1"], f"a rejected config changes nothing: {config}")
+
+    copy = model.with_name(model.name + ".copy.gguf")
+    shutil.copyfile(model, copy)
+    try:
+        check(request("/config", {"index": str(other), "model": str(copy)}, "PUT") == {"ok": True}, "swapping database and model")
+        check(request("/cache", TAIL) == {"ok": True}, "caching with the swapped model")
+        check(request("/config", served, "PUT") == {"ok": True}, "swapping back")
+        check(request("/version", {"modules": [MODULE]}) == ["packed-v1"], "swapping models leaves the database")
+    finally:
+        copy.unlink(missing_ok=True)
 
 
 def main() -> int:
-    global BASE_URL
-    args = parse_args()
+    global URL
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--model", type=Path, default=os.environ.get("PREMISE_MODEL"), help="GGUF embedding model")
+    ap.add_argument("--server-bin", type=Path, default=REPO_ROOT / "build" / "bin" / "llama-server")
+    ap.add_argument("--port", type=int, default=8081)
+    args = ap.parse_args()
+    if not args.model or not args.model.is_file():
+        sys.exit("pass --model or set PREMISE_MODEL to a GGUF embedding model")
+    URL = f"http://127.0.0.1:{args.port}"
 
-    if args.print_guide:
-        print_usage_guide(args)
-        return 0
-
-    if args.url:
-        BASE_URL = args.url.rstrip("/")
-        return 0 if run_tests(args) else 1
-
-    BASE_URL = f"http://{args.host}:{args.port}"
-    BUILD_DIR.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="premise-switch-", dir=BUILD_DIR) as directory:
-        with ManagedPremiseServer(args):
-            return 0 if run_tests(args, str(Path(directory) / "premise.db"), args.model) else 1
+    with tempfile.TemporaryDirectory(prefix="premise-test-") as tmp:
+        index, other, log = Path(tmp) / "premise.db", Path(tmp) / "other.db", Path(tmp) / "server.log"
+        with open(log, "w") as out:
+            server = subprocess.Popen([str(args.server_bin), "--premise", "--model", str(args.model), "--pooling", "mean",
+                                       "--index-db", str(index), "--host", "127.0.0.1", "--port", str(args.port)],
+                                      stdout=out, stderr=subprocess.STDOUT)
+        try:
+            for _ in range(600):
+                if server.poll() is not None:
+                    sys.exit(f"llama-server exited with {server.returncode}:\n{log.read_text()}")
+                try:
+                    urllib.request.urlopen(URL + "/health", timeout=1)
+                    break
+                except OSError:
+                    time.sleep(0.2)
+            run(index, other, args.model)
+        except AssertionError as error:
+            print(f"FAIL: {error}", file=sys.stderr)
+            return 1
+        finally:
+            server.terminate()
+            server.wait(timeout=10)
+    print("premise mode OK")
+    return 0
 
 
 if __name__ == "__main__":

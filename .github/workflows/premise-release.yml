@@ -1,6 +1,6 @@
 name: Premise Release
 
-# Builds llama-server (PremiseServer=ON, so runtime `llama-server --premise`
+# Builds llama-server (LLAMA_SERVER_PREMISE=ON, so runtime `llama-server --premise`
 # is available) and publishes self-contained archives. Unlike upstream
 # release.yml (which splits Windows CUDA into bin + cudart zips), every
 # archive here has the binaries and runtime libs needed to run, because the
@@ -16,14 +16,12 @@ name: Premise Release
 #   llama-<tag>-bin-win-cuda-13.3-x64.zip
 #   llama-<tag>-bin-win-cpu-arm64.zip
 #
-# Branch pushes and workflow_dispatch build Actions artifacts.
+# Only llama-server is built; it pulls in every backend it can load.
+# Manual runs (workflow_dispatch) build Actions artifacts.
 # Publishing a premise-* release builds and attaches its tagged binaries.
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - '**'
   release:
     types: [published]
 
@@ -31,7 +29,7 @@ permissions:
   contents: read
 
 env:
-  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DPremiseServer=ON"
+  CMAKE_ARGS: "-DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON -DLLAMA_SERVER_PREMISE=ON"
 
 concurrency:
   group: premise-release-${{ github.ref }}
@@ -84,7 +82,7 @@ jobs:
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
             -DLLAMA_BUILD_BORINGSSL=ON \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j $(sysctl -n hw.logicalcpu)
+          cmake --build build --config Release --target llama-server -j $(sysctl -n hw.logicalcpu)
 
       - name: Pack artifacts
         run: |
@@ -141,10 +139,11 @@ jobs:
             -DGGML_VULKAN=ON \
             "-DCMAKE_EXE_LINKER_FLAGS=-static-libstdc++ -static-libgcc" \
             "-DCMAKE_SHARED_LINKER_FLAGS=-static-libstdc++ -static-libgcc" \
+            "-DCMAKE_MODULE_LINKER_FLAGS=-static-libstdc++ -static-libgcc" \
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j $(nproc)
-          cmake --build build --config Release --target test-premise-index -j $(nproc)
+          cmake --build build --config Release --target llama-server test-premise-index -j $(nproc)
           ./build/bin/test-premise-index
+          rm build/bin/test-premise-index
 
       - name: Check libstdc++ is bundled
         # systems with an older libstdc++ than the runner's (e.g. RHEL clusters) cannot load it
@@ -190,7 +189,7 @@ jobs:
             -DGGML_CPU_ALL_VARIANTS=ON `
             -DLLAMA_BUILD_BORINGSSL=ON `
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release -j ${env:NUMBER_OF_PROCESSORS}
+          cmake --build build --config Release --target llama-server -j ${env:NUMBER_OF_PROCESSORS}
 
       - name: Pack artifacts
         run: |
@@ -229,7 +228,7 @@ jobs:
             -DGGML_CPU_ALL_VARIANTS=OFF ^
             -DGGML_OPENMP=OFF ^
             ${{ env.CMAKE_ARGS }}
-          cmake --build build --config Release
+          cmake --build build --config Release --target llama-server
 
       - name: Pack artifacts
         run: |
@@ -282,7 +281,7 @@ jobs:
             -DGGML_CUDA_CUB_3DOT2=ON ^
             ${{ env.CMAKE_ARGS }}
           set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
-          cmake --build build --config Release -j %NINJA_JOBS%
+          cmake --build build --config Release --target llama-server -j %NINJA_JOBS%
 
       - name: Pack artifacts
         shell: pwsh
